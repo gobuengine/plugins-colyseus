@@ -815,7 +815,23 @@ pub fn build(b: *std.Build) void {
             .windows => ".dll",
             else => ".so",
         };
-        const install_file = b.addInstallFile(lib.getEmittedBin(), b.fmt("../../../colyseus/bin/{s}{s}{s}", .{
+        // A release on Android goes in the game's package as it is: without its debug sections (the NDK's
+        // llvm-strip; Zig's own strip makes it build compiler_rt's tests).
+        var library = lib.getEmittedBin();
+        if (is_android and optimize != .Debug) {
+            if (std.process.getEnvVarOwned(b.allocator, "ANDROID_NDK_HOME")) |ndk_home| {
+                const builtin = @import("builtin");
+                const strip_host = switch (builtin.os.tag) {
+                    .windows => "windows-x86_64/bin/llvm-strip.exe",
+                    .macos => "darwin-x86_64/bin/llvm-strip",
+                    else => "linux-x86_64/bin/llvm-strip",
+                };
+                const strip = b.addSystemCommand(&.{ b.fmt("{s}/toolchains/llvm/prebuilt/{s}", .{ ndk_home, strip_host }), "--strip-debug", "-o" });
+                library = strip.addOutputFileArg(b.fmt("lib{s}.so", .{lib_name}));
+                strip.addFileArg(lib.getEmittedBin());
+            } else |_| {}
+        }
+        const install_file = b.addInstallFile(library, b.fmt("../../../colyseus/bin/{s}{s}{s}", .{
             lib_prefix,
             lib_name,
             lib_ext,

@@ -37,8 +37,17 @@ zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseFast   # libcolyseus_gobu
 zig build -Dtarget=wasm32-emscripten -Doptimize=Debug         # libcolyseus_gobu.web.wasm32.debug.wasm
 ```
 
-The libraries go to the plugin's folder, `../colyseus/bin`, which `plugin.json` lists. The sources also build
-for Linux and macOS (`-Dtarget=x86_64-linux`, `aarch64-macos`).
+Android (arm64-v8a, the ABI of Gobu's Android templates) needs the NDK in `ANDROID_NDK_HOME` (the one `forja`
+puts in Gobu's `Engine/Extras/ThirdPartyTools/android-sdk/ndk/<version>`):
+
+```bash
+ANDROID_NDK_HOME=<ndk> zig build -Dtarget=aarch64-linux-android -Doptimize=ReleaseFast   # libcolyseus_gobu.android.arm64.release.so
+ANDROID_NDK_HOME=<ndk> zig build -Dtarget=aarch64-linux-android -Doptimize=Debug         # libcolyseus_gobu.android.arm64.debug.so
+```
+
+The release goes without its debug sections (the NDK's `llvm-strip`). The libraries go to the plugin's folder,
+`../colyseus/bin`, which `plugin.json` lists. The sources also build for Linux and macOS
+(`-Dtarget=x86_64-linux`, `aarch64-macos`), which Gobu has no export templates for yet.
 
 ## The server
 

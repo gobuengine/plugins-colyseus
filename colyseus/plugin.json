@@ -11,6 +11,8 @@
 		"windows.x86_64.debug": "bin/colyseus_gobu.windows.x86_64.debug.dll",
 		"windows.x86_64": "bin/colyseus_gobu.windows.x86_64.release.dll",
 		"web.wasm32.debug": "bin/libcolyseus_gobu.web.wasm32.debug.wasm",
-		"web.wasm32": "bin/libcolyseus_gobu.web.wasm32.release.wasm"
+		"web.wasm32": "bin/libcolyseus_gobu.web.wasm32.release.wasm",
+		"android.arm64.debug": "bin/libcolyseus_gobu.android.arm64.debug.so",
+		"android.arm64": "bin/libcolyseus_gobu.android.arm64.release.so"
 	}
 }
