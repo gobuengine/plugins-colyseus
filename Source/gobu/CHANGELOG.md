@@ -11,7 +11,7 @@ the repository's history.
   of 15; Zig's own strip makes it build compiler_rt's tests). The export puts it in the package's
   `lib/arm64-v8a`; it needs Gobu's Android templates with plugins.
 - `plugin.json` asks for `INTERNET` (`android_permissions`): without it Android doesn't let the game reach the
-  server, and an Android export of a game with the plugin enabled now asks for it. Tried on a phone (Android
+  server; enabling the plugin ticks it in the project's Android presets (disabling it unticks it). Tried on a phone (Android
   11, arm64): it hosts a room a game on a computer joins.
 
 ### Host, Join and a dedicated server
