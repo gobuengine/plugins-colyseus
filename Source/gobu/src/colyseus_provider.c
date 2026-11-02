@@ -3,6 +3,8 @@
  * Colyseus room of the same mode with room, or makes one (the server's GobuRelayRoom, "gobu_relay"). The
  * first game in a room is the host (peer 1, it runs the world); the room passes the packets along. When the
  * host leaves, the room makes the player with the lowest id the host (Session > Host Migration), or ends.
+ * Online.host() and serve() (a dedicated server) make a room of the session's mode; Online.join() only joins
+ * one that is open.
  *
  * The server is Project Settings > Online > Session > Address ("localhost", "wss://example.com") and Port.
  *
@@ -218,8 +220,9 @@ static char *setting_text(const char *p_name, const char *p_default) {
 	return text ? text : strdup(p_default);
 }
 
-static void *provider_match(void *p_userdata, const char *p_mode, int32_t p_max_players, const GobuOnlineEvents *p_events, GobuVariant *r_error) {
-	(void)p_userdata;
+/* A connection to the Colyseus server at `p_address` (a host, "localhost", or a URL, "wss://example.com") and
+ * `p_port`, unless the address names its own; NULL with `r_error` set when there is no room for another one. */
+static Connection *new_connection(const GobuOnlineEvents *p_events, const char *p_address, int32_t p_port, GobuVariant *r_error) {
 	Connection *connection = (Connection *)calloc(1, sizeof(Connection));
 	connection->events = *p_events;
 
@@ -235,10 +238,7 @@ static void *provider_match(void *p_userdata, const char *p_mode, int32_t p_max_
 		return NULL;
 	}
 
-	/* Session > Address: a host ("localhost", "example.com") or a URL ("wss://example.com"). */
-	char *address = setting_text("online/session/address", "localhost");
-	char *port_text = setting_text("online/session/port", "2567");
-	const char *host = address[0] ? address : "localhost";
+	const char *host = p_address && p_address[0] ? p_address : "localhost";
 	bool secure = false;
 	if (strncmp(host, "wss://", 6) == 0 || strncmp(host, "https://", 8) == 0) {
 		secure = true;
@@ -259,7 +259,7 @@ static void *provider_match(void *p_userdata, const char *p_mode, int32_t p_max_
 		snprintf(port, sizeof(port), "%s", colon + 1);
 		*colon = '\0';
 	} else {
-		snprintf(port, sizeof(port), "%s", port_text);
+		snprintf(port, sizeof(port), "%d", (int)p_port);
 	}
 
 	colyseus_settings_t *settings = colyseus_settings_create();
@@ -273,25 +273,80 @@ static void *provider_match(void *p_userdata, const char *p_mode, int32_t p_max_
 	}
 	connection->settings = settings;
 	connection->client = colyseus_client_create(settings);
-	free(address);
-	free(port_text);
+	return connection;
+}
 
-	/* The mode as JSON text: only letters, digits and a few signs are kept (it is a game's name). */
+/* The room's options as JSON: the mode (`p_mode`, or Session > Mode when NULL), how many games it takes, and
+ * Session > Host Migration. */
+static void room_options(char *r_options, size_t p_size, const char *p_mode, int32_t p_max_clients) {
+	char *session_mode = p_mode ? NULL : setting_text("online/session/mode", "");
+	/* Only letters, digits and a few signs are kept (it is a game's name). */
 	char mode[64];
 	size_t length = 0;
-	for (const char *c = p_mode ? p_mode : ""; *c && length < sizeof(mode) - 1; c++) {
+	for (const char *c = p_mode ? p_mode : session_mode; *c && length < sizeof(mode) - 1; c++) {
 		if ((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '_' || *c == '-' || *c == ' ') {
 			mode[length++] = *c;
 		}
 	}
 	mode[length] = '\0';
-	/* Session > Host Migration (on unless set to false). */
+	free(session_mode);
+	/* On unless set to false. */
 	char *migration = setting_text("online/session/host_migration", "true");
 	const bool migrate = strcmp(migration, "false") != 0;
 	free(migration);
+	snprintf(r_options, p_size, "{\"mode\":\"%s\",\"maxClients\":%d,\"migration\":%s}", mode, (int)p_max_clients, migrate ? "true" : "false");
+}
+
+/* Session > Address and Port. */
+static Connection *new_session_connection(const GobuOnlineEvents *p_events, GobuVariant *r_error) {
+	char *address = setting_text("online/session/address", "localhost");
+	char *port_text = setting_text("online/session/port", "2567");
+	Connection *connection = new_connection(p_events, address, atoi(port_text), r_error);
+	free(address);
+	free(port_text);
+	return connection;
+}
+
+/* A room of `p_mode` with room, or a new one. */
+static void *provider_match(void *p_userdata, const char *p_mode, int32_t p_max_players, const GobuOnlineEvents *p_events, GobuVariant *r_error) {
+	(void)p_userdata;
+	Connection *connection = new_session_connection(p_events, r_error);
+	if (!connection) {
+		return NULL;
+	}
 	char options[192];
-	snprintf(options, sizeof(options), "{\"mode\":\"%s\",\"maxClients\":%d,\"migration\":%s}", mode, (int)p_max_players, migrate ? "true" : "false");
+	room_options(options, sizeof(options), p_mode ? p_mode : "", p_max_players);
 	colyseus_client_join_or_create(connection->client, ROOM_NAME, options, on_matched, on_match_error, connection);
+	return connection;
+}
+
+/* A new room of Session > Mode, made by this game: peer 1, a host that plays or a dedicated server (which is not
+ * a player: its room takes one game more). Its port is the Colyseus server's. */
+static void *provider_open(void *p_userdata, int32_t p_port, int32_t p_max_players, const GobuOnlineEvents *p_events, GobuVariant *r_error) {
+	(void)p_userdata;
+	char *address = setting_text("online/session/address", "localhost");
+	Connection *connection = new_connection(p_events, address, p_port, r_error);
+	free(address);
+	if (!connection) {
+		return NULL;
+	}
+	char options[192];
+	room_options(options, sizeof(options), NULL, p_max_players + 1);
+	colyseus_client_create_room(connection->client, ROOM_NAME, options, on_matched, on_match_error, connection);
+	return connection;
+}
+
+/* A room of Session > Mode that is open (a dedicated server's, or a host's), on the Colyseus server at
+ * `p_address`: never a new one. */
+static void *provider_join(void *p_userdata, const char *p_address, int32_t p_port, const GobuOnlineEvents *p_events, GobuVariant *r_error) {
+	(void)p_userdata;
+	Connection *connection = new_connection(p_events, p_address, p_port, r_error);
+	if (!connection) {
+		return NULL;
+	}
+	char options[192];
+	room_options(options, sizeof(options), NULL, 0);
+	colyseus_client_join(connection->client, ROOM_NAME, options, on_matched, on_match_error, connection);
 	return connection;
 }
 
@@ -407,8 +462,10 @@ bool colyseus_register_online_provider(const GobuPluginApi *p_api, GobuPluginHan
 	GobuOnlineProviderInfo info;
 	memset(&info, 0, sizeof(info));
 	info.name = "colyseus";
-	info.flags = GOBU_ONLINE_CAN_MATCH;
+	info.flags = GOBU_ONLINE_CAN_MATCH | GOBU_ONLINE_CAN_OPEN | GOBU_ONLINE_CAN_JOIN;
 	info.match = provider_match;
+	info.open = provider_open;
+	info.join = provider_join;
 	info.send = provider_send;
 	info.kick = provider_kick;
 	info.poll = provider_poll;

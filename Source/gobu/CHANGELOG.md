@@ -5,6 +5,13 @@ the repository's history.
 
 ## Gobu
 
+### Host, Join and a dedicated server
+- The `colyseus` provider opens and joins games too, not only matches: `Online.host()` and `Online.serve()`
+  (Start: Host, Start: Dedicated Server, the exported server) make a room of Session > Mode where this game is
+  peer 1, a host that plays or a dedicated server (its room takes one game more); `Online.join()` (Start: Join)
+  joins a room of the mode that is open, and never makes one. The port is the Colyseus server's.
+- With Gobu's Online: when a dedicated server leaves its room, the game ends for its players (no migration).
+
 ### The room sends players away
 - The `colyseus` provider has `kick`: when the host sends a player away (`Online.kick()`, or a login it turned
   away), `GobuRelayRoom` closes that game's connection (code 4003), taking the request (`"k"`) from the host
