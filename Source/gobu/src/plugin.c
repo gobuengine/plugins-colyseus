@@ -913,13 +913,13 @@ static void register_colyseus_client(void) {
 
     // Register HTTP methods (use call_vararg — functions take Variant args)
     {
-        const char* http_methods[] = { "http_get", "http_post", "http_put", "http_delete", "http_patch" };
+        const char* http_methods[] = { "http_get", "http_post", "http_put", "http_delete", "http_patch", "auth_request" };
         void* http_funcs[] = {
             gobuext_colyseus_client_http_get, gobuext_colyseus_client_http_post,
             gobuext_colyseus_client_http_put, gobuext_colyseus_client_http_delete,
-            gobuext_colyseus_client_http_patch
+            gobuext_colyseus_client_http_patch, gobuext_colyseus_client_auth_request
         };
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < 6; i++) {
             StringName method_name_string;
             constructors.string_name_new_with_latin1_chars(&method_name_string, http_methods[i], false);
 
@@ -956,6 +956,7 @@ static void register_colyseus_client(void) {
         "token", NATIVEEXTENSION_VARIANT_TYPE_STRING);
     bind_method_0_with_ret("_ColyseusClient", "auth_get_token", gobuext_colyseus_client_auth_get_token,
         NATIVEEXTENSION_VARIANT_TYPE_STRING);
+    bind_method_0_no_ret("_ColyseusClient", "auth_signout", gobuext_colyseus_client_auth_signout);
 
     // Register static poll() method
     {

@@ -5,6 +5,15 @@ the repository's history.
 
 ## Gobu
 
+### Colyseus.Auth works
+- `colyseus.gro`'s `Colyseus.Auth` called a native `auth_request()` (and `auth_signout()`) the binding did not
+  have. Now `_ColyseusClient.auth_request(op, email, password, options_json)` runs the SDK's auth operation (user
+  data, register, sign in, anonymous, password reset) as an HTTP request is run, and answers through
+  `_http_response` (`{"user": {...}, "token": "..."}`; the SDK keeps the token) or `_http_error`;
+  `auth_signout()` forgets the token.
+- On the web, an HTTP request was freed as soon as it was sent, but the browser answers later: its answer read
+  freed memory. It is now freed when it answers.
+
 ### Arrays of the state as the server has them
 - A child added once came twice: the full state and a patch both carry what changed when a client joined, and an
   ADD at index 0 of a non-empty array is an unshift. The decoder now skips the same value at its index, as

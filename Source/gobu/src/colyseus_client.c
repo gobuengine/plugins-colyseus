@@ -1,6 +1,7 @@
 #include "gobu_colyseus.h"
 #include "msgpack_variant.h"
 #include "tls_certificates.h"
+#include <colyseus/auth/auth.h>
 #include <colyseus/client.h>
 #include <colyseus/http.h>
 #include <colyseus/room.h>
@@ -839,11 +840,45 @@ typedef struct {
     colyseus_http_t* http;
     char* path;
     char* body;
-    int method;  // 0=GET, 1=POST, 2=PUT, 3=DELETE, 4=PATCH
+    int method;  // 0=GET, 1=POST, 2=PUT, 3=DELETE, 4=PATCH, 5=an auth operation (auth_op)
     int64_t request_id;
     NativeExtensionObjectPtr client_object;
     ColyseusClientWrapper* wrapper;  // For decrementing pending count
+    // An auth operation (colyseus.gro's _AUTH_*: the order is the ABI); `body` is its options' JSON.
+    colyseus_auth_t* auth;
+    int auth_op;
+    char* email;
+    char* password;
 } gobuext_http_request_t;
+
+enum {
+    GOBUEXT_AUTH_GET_USER_DATA,
+    GOBUEXT_AUTH_REGISTER,
+    GOBUEXT_AUTH_SIGN_IN,
+    GOBUEXT_AUTH_SIGN_IN_ANONYMOUS,
+    GOBUEXT_AUTH_SEND_PASSWORD_RESET,
+};
+
+static void gobuext_http_request_free(gobuext_http_request_t* req) {
+    if (req->wrapper) {
+        __sync_fetch_and_sub(&req->wrapper->pending_http_requests, 1);
+    }
+    free(req->path);
+    free(req->body);
+    free(req->email);
+    free(req->password);
+    free(req);
+}
+
+// Its answer is queued. On the web a request answers later (an asynchronous fetch), so it is freed here; elsewhere
+// the call blocks and its thread frees it afterwards.
+static void gobuext_http_request_answered(gobuext_http_request_t* req) {
+#ifdef __EMSCRIPTEN__
+    gobuext_http_request_free(req);
+#else
+    (void)req;
+#endif
+}
 
 // HTTP success trampoline — pushes to event queue (processed in poll)
 static void on_gobuext_http_success(const colyseus_http_response_t* response, void* userdata) {
@@ -857,6 +892,7 @@ static void on_gobuext_http_success(const colyseus_http_response_t* response, vo
     event->body_or_message = response->body ? strdup(response->body) : strdup("");
     event->client_object = req->client_object;
     http_event_push(event);
+    gobuext_http_request_answered(req);
 }
 
 // HTTP error trampoline — pushes to event queue (processed in poll)
@@ -871,6 +907,69 @@ static void on_gobuext_http_error(const colyseus_http_error_t* error, void* user
     event->body_or_message = error->message ? strdup(error->message) : strdup("");
     event->client_object = req->client_object;
     http_event_push(event);
+    gobuext_http_request_answered(req);
+}
+
+// An auth operation answers as an HTTP request does: `{"user": {...}, "token": "..."}`, the server's answer (the SDK
+// keeps the token itself).
+static void on_gobuext_auth_success(const colyseus_auth_data_t* data, void* userdata) {
+    gobuext_http_request_t* req = (gobuext_http_request_t*)userdata;
+    const char* user = data && data->user_json && data->user_json[0] ? data->user_json : "null";
+    const char* token = data && data->token ? data->token : "";
+    size_t size = strlen(user) + strlen(token) + 32;
+    char* body = (char*)malloc(size);
+    gobuext_http_event_t* event = (gobuext_http_event_t*)calloc(1, sizeof(gobuext_http_event_t));
+    if (body && event) {
+        // The token is a JWT (base64url and dots): nothing to escape.
+        snprintf(body, size, "{\"user\":%s,\"token\":\"%s\"}", user, token);
+        event->is_error = 0;
+        event->request_id = req->request_id;
+        event->status_or_code = 200;
+        event->body_or_message = body;
+        event->client_object = req->client_object;
+        http_event_push(event);
+    } else {
+        free(body);
+        free(event);
+    }
+    gobuext_http_request_answered(req);
+}
+
+static void on_gobuext_auth_error(const char* message, void* userdata) {
+    gobuext_http_request_t* req = (gobuext_http_request_t*)userdata;
+    gobuext_http_event_t* event = (gobuext_http_event_t*)calloc(1, sizeof(gobuext_http_event_t));
+    if (event) {
+        event->is_error = 1;
+        event->request_id = req->request_id;
+        event->status_or_code = 0;  // The SDK's auth reports only a message.
+        event->body_or_message = strdup(message ? message : "");
+        event->client_object = req->client_object;
+        http_event_push(event);
+    }
+    gobuext_http_request_answered(req);
+}
+
+static void gobuext_auth_run(gobuext_http_request_t* req) {
+    switch (req->auth_op) {
+        case GOBUEXT_AUTH_GET_USER_DATA:
+            colyseus_auth_get_user_data(req->auth, on_gobuext_auth_success, on_gobuext_auth_error, req);
+            break;
+        case GOBUEXT_AUTH_REGISTER:
+            colyseus_auth_register_email_password(req->auth, req->email, req->password, req->body, on_gobuext_auth_success, on_gobuext_auth_error, req);
+            break;
+        case GOBUEXT_AUTH_SIGN_IN:
+            colyseus_auth_signin_email_password(req->auth, req->email, req->password, on_gobuext_auth_success, on_gobuext_auth_error, req);
+            break;
+        case GOBUEXT_AUTH_SIGN_IN_ANONYMOUS:
+            colyseus_auth_signin_anonymous(req->auth, req->body, on_gobuext_auth_success, on_gobuext_auth_error, req);
+            break;
+        case GOBUEXT_AUTH_SEND_PASSWORD_RESET:
+            colyseus_auth_send_password_reset(req->auth, req->email, on_gobuext_auth_success, on_gobuext_auth_error, req);
+            break;
+        default:
+            on_gobuext_auth_error("Unknown auth operation", req);
+            break;
+    }
 }
 
 // Thread function — runs the blocking HTTP call
@@ -881,13 +980,11 @@ static void gobuext_http_thread_func(gobuext_http_request_t* req) {
         case 2: colyseus_http_put(req->http, req->path, req->body, on_gobuext_http_success, on_gobuext_http_error, req); break;
         case 3: colyseus_http_delete(req->http, req->path, on_gobuext_http_success, on_gobuext_http_error, req); break;
         case 4: colyseus_http_patch(req->http, req->path, req->body, on_gobuext_http_success, on_gobuext_http_error, req); break;
+        case 5: gobuext_auth_run(req); break;
     }
-    if (req->wrapper) {
-        __sync_fetch_and_sub(&req->wrapper->pending_http_requests, 1);
-    }
-    free(req->path);
-    if (req->body) free(req->body);
-    free(req);
+#ifndef __EMSCRIPTEN__
+    gobuext_http_request_free(req);  // The call blocked: its answer is queued.
+#endif
 }
 
 #ifndef __EMSCRIPTEN__
@@ -904,8 +1001,9 @@ static void* gobuext_http_thread_wrapper(void* arg) {
 #endif
 #endif
 
-// Dispatch HTTP request, returns request_id
-static int64_t gobuext_http_dispatch(ColyseusClientWrapper* wrapper, int method, const char* path, const char* body) {
+// Dispatch HTTP request (method 5: the auth operation `auth_op`), returns request_id
+static int64_t gobuext_http_dispatch_full(ColyseusClientWrapper* wrapper, int method, const char* path, const char* body,
+    int auth_op, const char* email, const char* password) {
     if (!wrapper || !wrapper->native_client || !wrapper->native_client->http) return 0;
 
     gobuext_http_request_t* req = (gobuext_http_request_t*)calloc(1, sizeof(gobuext_http_request_t));
@@ -914,11 +1012,15 @@ static int64_t gobuext_http_dispatch(ColyseusClientWrapper* wrapper, int method,
     g_http_request_counter++;
     req->http = wrapper->native_client->http;
     req->path = strdup(path ? path : "");
-    req->body = body ? strdup(body) : NULL;
+    req->body = body && body[0] ? strdup(body) : NULL;
     req->method = method;
     req->request_id = g_http_request_counter;
     req->client_object = wrapper->gobu_object;
     req->wrapper = wrapper;
+    req->auth = wrapper->native_client->auth;
+    req->auth_op = auth_op;
+    req->email = email ? strdup(email) : NULL;
+    req->password = password ? strdup(password) : NULL;
     __sync_fetch_and_add(&wrapper->pending_http_requests, 1);
 
 #ifdef __EMSCRIPTEN__
@@ -936,6 +1038,10 @@ static int64_t gobuext_http_dispatch(ColyseusClientWrapper* wrapper, int method,
 #endif
 
     return g_http_request_counter;
+}
+
+static int64_t gobuext_http_dispatch(ColyseusClientWrapper* wrapper, int method, const char* path, const char* body) {
+    return gobuext_http_dispatch_full(wrapper, method, path, body, -1, NULL, NULL);
 }
 
 // =============================================================================
@@ -1258,6 +1364,45 @@ void gobuext_colyseus_client_auth_set_token(void* p_method_userdata, NativeExten
     char* token = string_to_c_str(token_string);
     colyseus_http_set_auth_token(wrapper->native_client->http, token);
     free(token);
+}
+
+// auth_request(op: int, email: String, password: String, options_json: String) -> int: an auth operation of
+// colyseus.gro (_AUTH_*), answered by _http_response / _http_error as an HTTP request.
+void gobuext_colyseus_client_auth_request(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance,
+    const NativeExtensionConstVariantPtr* p_args, NativeExtensionInt p_argument_count,
+    NativeExtensionVariantPtr r_return, NativeExtensionCallError* r_error) {
+    (void)p_method_userdata; (void)r_error;
+    ColyseusClientWrapper* wrapper = (ColyseusClientWrapper*)p_instance;
+    if (!wrapper || !wrapper->native_client || p_argument_count < 4) return;
+
+    int64_t op = 0;
+    constructors.int_from_variant_constructor(&op, (NativeExtensionVariantPtr)p_args[0]);
+    String texts[3];
+    char* values[3];
+    for (int i = 0; i < 3; i++) {
+        constructors.string_from_variant_constructor(&texts[i], (NativeExtensionVariantPtr)p_args[i + 1]);
+        values[i] = string_to_c_str(&texts[i]);
+    }
+
+    int64_t rid = gobuext_http_dispatch_full(wrapper, 5, "", values[2], (int)op, values[0], values[1]);
+    if (r_return) {
+        constructors.variant_from_int_constructor(r_return, &rid);
+    }
+
+    for (int i = 0; i < 3; i++) {
+        destructors.string_destructor(&texts[i]);
+        free(values[i]);
+    }
+}
+
+// auth_signout(): forgets the token, here and in the secure storage. No request.
+void gobuext_colyseus_client_auth_signout(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance,
+    const NativeExtensionConstTypePtr* p_args, NativeExtensionTypePtr r_ret) {
+    (void)p_method_userdata; (void)p_args; (void)r_ret;
+    ColyseusClientWrapper* wrapper = (ColyseusClientWrapper*)p_instance;
+    if (wrapper && wrapper->native_client && wrapper->native_client->auth) {
+        colyseus_auth_signout(wrapper->native_client->auth);
+    }
 }
 
 // auth_get_token() -> String

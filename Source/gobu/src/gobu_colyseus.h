@@ -255,6 +255,8 @@ void gobuext_colyseus_client_http_patch(void* p_method_userdata, NativeExtension
 
 // ColyseusClient auth methods
 void gobuext_colyseus_client_auth_set_token(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstTypePtr* p_args, NativeExtensionTypePtr r_ret);
+void gobuext_colyseus_client_auth_request(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstVariantPtr* p_args, NativeExtensionInt p_argument_count, NativeExtensionVariantPtr r_return, NativeExtensionCallError* r_error);
+void gobuext_colyseus_client_auth_signout(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstTypePtr* p_args, NativeExtensionTypePtr r_ret);
 void gobuext_colyseus_client_auth_get_token(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstTypePtr* p_args, NativeExtensionTypePtr r_ret);
 
 // ColyseusRoom methods
