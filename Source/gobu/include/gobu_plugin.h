@@ -70,7 +70,7 @@
 extern "C" {
 #endif
 
-#define GOBU_PLUGIN_API_VERSION 2
+#define GOBU_PLUGIN_API_VERSION 3
 
 #if defined(_WIN32)
 #define GOBU_PLUGIN_EXPORT __declspec(dllexport)
@@ -365,6 +365,13 @@ typedef struct GobuPluginApi {
 	/* Version 2. */
 	/* Only inside the init function. The engine copies `info` (its `name` too). */
 	bool (*register_online_provider)(GobuPluginHandle plugin, const GobuOnlineProviderInfo *info);
+
+	/* Version 3. */
+	/* Only inside the init function, after register_class: a new object of `class_name` (a class of this
+	 * plugin, not a RefCounted nor GOBU_CLASS_HIDDEN) reached by `name` as the engine's singletons are
+	 * (`Name.method()` in a script, get_singleton).
+	 * The engine owns it and frees it at shutdown, before `deinitialize`. NULL if it can't be made. */
+	GobuObject *(*register_singleton)(GobuPluginHandle plugin, const char *name, const char *class_name);
 } GobuPluginApi;
 
 /* Filled by the plugin's init function. */

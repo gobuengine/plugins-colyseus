@@ -3,10 +3,6 @@
 
 #include "tls_certificates.h"
 
-void gobuext_tls_certificates_set_api(NativeExtensionInterfaceGetProcAddress p_get_proc_address) {
-    (void)p_get_proc_address;
-}
-
 void gobuext_tls_certificates_init(void) {}
 
 void gobuext_tls_certificates_cleanup(void) {}

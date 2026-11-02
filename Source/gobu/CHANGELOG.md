@@ -5,6 +5,25 @@ the repository's history.
 
 ## Gobu
 
+### Straight on gobu_plugin.h
+- The binding used NativeExtension, Gobu's former extension API, through a layer that turned its calls into
+  `gobu_plugin.h` ones (`gobu_compat.c`, with `nativeextension_interface.h`). Now it calls `gobu_plugin.h`
+  directly: every engine value is a `GobuVariant`, each method is a `GobuMethodFunc` with Variant arguments, and
+  `plugin.c` registers the classes with `register_class` / `register_method` / `register_signal` (the
+  call/ptrcall wrappers of each method are gone: the engine checks the arguments' count and types).
+  `gobu_plugin.h` is the engine's version 3; the plugin still needs only version 1 (2 for the provider).
+- A new room or callbacks object is made with `classdb_instantiate()` and its data read with
+  `object_get_plugin_instance()`, instead of the "last instance made" and the table of rooms by id.
+- Events handed over in `poll()` keep the room's or client's object id, not its pointer: a room the game
+  dropped before its event came is skipped (`object_from_instance_id()`), not used after it was freed. The
+  client no longer throws away every client's pending HTTP answers when one is freed.
+- The state no longer leaks: each nested schema, array and map was a Dictionary or Array copied into its parent
+  and never released, and each field's value too.
+- `msgpack_variant.c`: a binary value is one `variant_new_packed_byte_array()`; a payload that fails to decode
+  releases the containers it had opened.
+- The web build's define is `COLYSEUS_SIDE_MODULE` (was `NATIVEEXTENSION_SIDE_MODULE`); `build.zig` no longer
+  has the `gobu-double-precision` option (a `GobuVariant` is 24 bytes either way).
+
 ### Colyseus.Auth works
 - `colyseus.gro`'s `Colyseus.Auth` called a native `auth_request()` (and `auth_signout()`) the binding did not
   have. Now `_ColyseusClient.auth_request(op, email, password, options_json)` runs the SDK's auth operation (user

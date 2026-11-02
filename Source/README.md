@@ -13,10 +13,10 @@ Source/
 ```
 
 Gobu loads the binding as an external plugin through its C interface, `gobu/include/gobu_plugin.h` (a copy
-of the engine's). The binding was written against NativeExtension, Gobu's former extension API:
-`gobu/src/gobu_compat.c` implements the NativeExtension functions it uses on top of `gobu_plugin.h`, and the
-entry point is `gobu_plugin_init` (`gobu/src/plugin.c`). It also registers the `colyseus` provider of
-Online (`gobu/src/colyseus_provider.c`). The Grost side is `../colyseus/colyseus.gro`.
+of the engine's), and nothing else: every engine value it holds is a `GobuVariant`, and its classes'
+methods take Variant arguments (`gobu/src/gobu_colyseus.h`). The entry point is `gobu_plugin_init`
+(`gobu/src/plugin.c`), which registers the classes and the `colyseus` provider of Online
+(`gobu/src/colyseus_provider.c`). The Grost side is `../colyseus/colyseus.gro`.
 
 ## Building
 
@@ -50,14 +50,24 @@ server with `GobuRelayRoom`, registered as `gobu_relay` and matched by Session >
 
 What `colyseus.gro` wraps; a game uses the Grost module `Colyseus`.
 
-`ColyseusClient`: `connect_to(endpoint)`, `join_or_create(room_name, options = {})`,
-`create_room(room_name, options = {})`, `join(room_name, options = {})`, `join_by_id(room_id, options = {})`,
-`reconnect(reconnection_token)` (a seat the server holds with `allowReconnection()`), `get_endpoint()`.
+`_ColyseusClient`: `set_endpoint(endpoint)`, `get_endpoint()`; `join_or_create(room_name, options_json = "{}")`,
+`create(room_name, options_json)`, `join(room_name, options_json)`, `join_by_id(room_id, options_json)` and
+`reconnect(reconnection_token)` (a seat the server holds with `allowReconnection()`) return a
+`_ColyseusRoom` at once, which joins later. `http_get(path)`, `http_post(path, body)`, `http_put`,
+`http_delete`, `http_patch` and `auth_request(op, email, password, options_json)` return a request id, answered
+by the signals `_http_response(request_id, status_code, body)` and `_http_error(request_id, code, message)`.
+`auth_set_token(token)`, `auth_get_token()`, `auth_signout()`. Static `poll()`: runs the network and emits
+the signals, on the main thread (`colyseus.gro` calls it every frame).
 
-`ColyseusRoom`: `send_message(type: String, data: PackedByteArray)`, `send_message_int(type: int, data)`,
-`leave(consented = true)`, `get_id()`, `get_session_id()`, `get_reconnection_token()`, `get_name()`,
-`is_connected()`. Signals: `joined()`, `state_changed()`, `message_received(data)`, `error(code, message)`,
-`left(code, reason)`.
+`_ColyseusRoom`: `send_message(type: String, data)`, `send_message_int(type: int, data)` (`data`: any value,
+sent as msgpack), `leave()`, `get_id()`, `get_session_id()`, `get_reconnection_token()`, `get_name()`,
+`is_connected()`, `is_reconnecting()`, `set_reconnection_options(options: Dictionary)`, `get_state()` (a
+Dictionary) and `set_state_type(type)` (a schema of `Colyseus.schema()`). Signals: `joined()`,
+`state_changed()`, `reconnected()`, `message_received(type, data)`, `error(code, message)`,
+`left(code, reason)`, `dropped(code, reason)`.
+
+`_ColyseusCallbacks`: static `get(room)`; `listen`, `on_add`, `on_remove`, `on_change` (a property of the
+state, or of a nested schema given as its Dictionary) return a handle for `remove(handle)`.
 
 ## License
 

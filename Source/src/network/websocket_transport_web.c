@@ -10,7 +10,7 @@
 // ============================================================================
 // SIDE_MODULE (Gobu) - Uses polling approach since JS can't callback to C
 // ============================================================================
-#ifdef NATIVEEXTENSION_SIDE_MODULE
+#ifdef COLYSEUS_SIDE_MODULE
 
 typedef struct {
     int socket_id;
@@ -565,7 +565,7 @@ static void web_ws_destroy_impl(colyseus_transport_t* transport) {
     free(transport);
 }
 
-#endif /* NATIVEEXTENSION_SIDE_MODULE */
+#endif /* COLYSEUS_SIDE_MODULE */
 
 /* Web stub: browser handles TLS natively, so settings are ignored */
 void colyseus_websocket_connect_with_settings(colyseus_transport_t* transport,

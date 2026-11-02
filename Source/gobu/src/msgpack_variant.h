@@ -25,14 +25,14 @@ extern "C" {
  * 
  * @param data Pointer to msgpack-encoded data
  * @param length Length of the data in bytes
- * @param out_variant Pointer to Variant to store the result (must be valid)
+ * @param out_variant The Variant to write (uninitialized)
  * @return true on success, false on decode error
  * 
  * @note The caller is responsible for destroying the variant when done
- *       using destructors.variant_destroy()
+ *       (gobu->variant_destroy()), also when this fails
  * @note Empty data (length == 0) returns nil and is considered valid
  */
-bool msgpack_to_gobu_variant(const uint8_t* data, size_t length, Variant* out_variant);
+bool msgpack_to_gobu_variant(const uint8_t* data, size_t length, GobuVariant* out_variant);
 
 #ifdef __cplusplus
 }

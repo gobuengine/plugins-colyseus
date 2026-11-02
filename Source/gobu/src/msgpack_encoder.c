@@ -1,6 +1,6 @@
 /**
  * Gobu Variant to Msgpack encoding
- * 
+ *
  * This module provides conversion from native Gobu Variant types to
  * msgpack-encoded binary data.
  */
@@ -74,15 +74,15 @@ static void buffer_free(EncoderBuffer* buf) {
 static bool buffer_ensure_capacity(EncoderBuffer* buf, size_t additional) {
     size_t required = buf->size + additional;
     if (required <= buf->capacity) return true;
-    
+
     size_t new_capacity = buf->capacity;
     while (new_capacity < required) {
         new_capacity *= BUFFER_GROWTH_FACTOR;
     }
-    
+
     uint8_t* new_data = (uint8_t*)realloc(buf->data, new_capacity);
     if (!new_data) return false;
-    
+
     buf->data = new_data;
     buf->capacity = new_capacity;
     return true;
@@ -196,14 +196,14 @@ static bool encode_int(EncoderBuffer* buf, int64_t value) {
 static bool encode_float(EncoderBuffer* buf, double value) {
     // Always use float64 for precision
     if (!buffer_write_byte(buf, MSGPACK_FLOAT64)) return false;
-    
+
     // Convert to big-endian bytes
     union {
         double d;
         uint64_t u;
     } conv;
     conv.d = value;
-    
+
     return buffer_write_uint64_be(buf, conv.u);
 }
 
@@ -224,7 +224,7 @@ static bool encode_string(EncoderBuffer* buf, const char* str, size_t len) {
         if (!buffer_write_byte(buf, MSGPACK_STR32)) return false;
         if (!buffer_write_uint32_be(buf, (uint32_t)len)) return false;
     }
-    
+
     return buffer_write_bytes(buf, (const uint8_t*)str, len);
 }
 
@@ -242,7 +242,7 @@ static bool encode_binary(EncoderBuffer* buf, const uint8_t* data, size_t len) {
         if (!buffer_write_byte(buf, MSGPACK_BIN32)) return false;
         if (!buffer_write_uint32_be(buf, (uint32_t)len)) return false;
     }
-    
+
     return buffer_write_bytes(buf, data, len);
 }
 
@@ -280,296 +280,106 @@ static bool encode_map_header(EncoderBuffer* buf, size_t len) {
 // Variant encoding (forward declaration for recursion)
 // ============================================================================
 
-static bool encode_variant(EncoderBuffer* buf, const Variant* variant);
-
-// ============================================================================
-// Gobu type helpers
-// ============================================================================
-
-// Get array size using variant_call
-static int64_t get_array_size(const Variant* arr_variant) {
-    StringName size_method;
-    constructors.string_name_new_with_latin1_chars(&size_method, "size", false);
-    
-    Variant return_val;
-    NativeExtensionCallError error;
-    api.variant_call((Variant*)arr_variant, &size_method, NULL, 0, &return_val, &error);
-    
-    int64_t size = 0;
-    if (error.error == NATIVEEXTENSION_CALL_OK) {
-        constructors.int_from_variant_constructor(&size, &return_val);
-    }
-    
-    destructors.string_name_destructor(&size_method);
-    destructors.variant_destroy(&return_val);
-    
-    return size;
-}
-
-// Get dictionary keys using variant_call
-static bool get_dictionary_keys(const Variant* dict_variant, Variant* out_keys) {
-    StringName keys_method;
-    constructors.string_name_new_with_latin1_chars(&keys_method, "keys", false);
-    
-    NativeExtensionCallError error;
-    api.variant_call((Variant*)dict_variant, &keys_method, NULL, 0, out_keys, &error);
-    
-    destructors.string_name_destructor(&keys_method);
-    
-    return error.error == NATIVEEXTENSION_CALL_OK;
-}
-
-// Get element at index from array using variant_call
-static bool get_array_element(const Variant* arr_variant, int64_t index, Variant* out_element) {
-    // Use variant_call to call the [] operator or get method
-    // This avoids issues with array_operator_index_const and reference handling
-    StringName get_method;
-    constructors.string_name_new_with_latin1_chars(&get_method, "get", false);
-    
-    // Create index variant
-    Variant index_variant;
-    constructors.variant_from_int_constructor(&index_variant, &index);
-    
-    NativeExtensionConstVariantPtr args[1] = { &index_variant };
-    NativeExtensionCallError error;
-    api.variant_call((Variant*)arr_variant, &get_method, args, 1, out_element, &error);
-    
-    destructors.string_name_destructor(&get_method);
-    destructors.variant_destroy(&index_variant);
-    
-    return error.error == NATIVEEXTENSION_CALL_OK;
-}
-
-// Get value from dictionary by key using variant_call
-static bool get_dictionary_value(const Variant* dict_variant, const Variant* key, Variant* out_value) {
-    // Use variant_call to call the get method
-    StringName get_method;
-    constructors.string_name_new_with_latin1_chars(&get_method, "get", false);
-    
-    NativeExtensionConstVariantPtr args[1] = { key };
-    NativeExtensionCallError error;
-    api.variant_call((Variant*)dict_variant, &get_method, args, 1, out_value, &error);
-    
-    destructors.string_name_destructor(&get_method);
-    
-    return error.error == NATIVEEXTENSION_CALL_OK;
-}
+static bool encode_variant(EncoderBuffer* buf, const GobuVariant* variant);
 
 // ============================================================================
 // Complex type encoding
 // ============================================================================
 
-static bool encode_gobu_string(EncoderBuffer* buf, const Variant* str_variant) {
-    String str;
-    constructors.string_from_variant_constructor(&str, str_variant);
-    
-    // Get string length
-    int32_t length = api.string_to_utf8_chars(&str, NULL, 0);
-    if (length <= 0) {
-        destructors.string_destructor(&str);
-        return encode_string(buf, "", 0);
-    }
-    
-    // Allocate buffer and extract string
-    char* buffer = (char*)malloc(length + 1);
-    if (!buffer) {
-        destructors.string_destructor(&str);
-        return false;
-    }
-    
-    api.string_to_utf8_chars(&str, buffer, length);
-    buffer[length] = '\0';
-    
-    bool result = encode_string(buf, buffer, (size_t)length);
-    
-    free(buffer);
-    destructors.string_destructor(&str);
-    
+// A String or StringName, as its UTF-8
+static bool encode_gobu_string(EncoderBuffer* buf, const GobuVariant* str_variant) {
+    char* text = gobuext_to_utf8(str_variant);
+    if (!text) return false;
+    bool result = encode_string(buf, text, strlen(text));
+    free(text);
     return result;
 }
 
-static bool encode_packed_byte_array(EncoderBuffer* buf, const Variant* pba_variant) {
-    // Extract the concrete PackedByteArray from the Variant first. Indexing the
-    // Variant pointer directly (cast to PackedByteArray*) reads the wrong memory:
-    // operator_index_const returns NULL for every element, so the bytes encode as
-    // all zeros. We must build the real PackedByteArray and index that.
-    PackedByteArray pba;
-    constructors.packed_byte_array_from_variant_constructor(&pba, pba_variant);
-
-    int64_t size = get_array_size(pba_variant);
-    if (size <= 0) {
-        destructors.packed_byte_array_destructor(&pba);
-        return encode_binary(buf, NULL, 0);
-    }
-
-    uint8_t* data = (uint8_t*)malloc((size_t)size);
-    if (!data) {
-        destructors.packed_byte_array_destructor(&pba);
-        return false;
-    }
-
-    for (int64_t i = 0; i < size; i++) {
-        const uint8_t* byte_ptr = api.packed_byte_array_operator_index_const(&pba, (NativeExtensionInt)i);
-        data[i] = byte_ptr ? *byte_ptr : 0;
-    }
-
-    bool result = encode_binary(buf, data, (size_t)size);
-    free(data);
-    destructors.packed_byte_array_destructor(&pba);
+static bool encode_packed_byte_array(EncoderBuffer* buf, const GobuVariant* pba_variant) {
+    // A copy to read: the engine gives its bytes writable, which would detach the game's own array.
+    GobuVariant bytes;
+    gobu->variant_new_copy(&bytes, pba_variant);
+    const int64_t size = gobu->variant_size(&bytes);
+    const uint8_t* data = size > 0 ? gobu->packed_byte_array_data(&bytes) : NULL;
+    bool result = encode_binary(buf, data, data ? (size_t)size : 0);
+    gobu->variant_destroy(&bytes);
     return result;
 }
 
-static bool encode_array(EncoderBuffer* buf, const Variant* arr_variant) {
-    int64_t size = get_array_size(arr_variant);
-    
+static bool encode_array(EncoderBuffer* buf, const GobuVariant* arr_variant) {
+    int64_t size = gobu->variant_size(arr_variant);
+
     if (!encode_array_header(buf, (size_t)size)) return false;
-    
+
     for (int64_t i = 0; i < size; i++) {
-        Variant element;
-        if (!get_array_element(arr_variant, i, &element)) {
-            return false;
-        }
-        
-        bool result = encode_variant(buf, &element);
-        destructors.variant_destroy(&element);
-        
+        GobuVariant element;
+        bool result = gobu->variant_get_indexed(arr_variant, i, &element) && encode_variant(buf, &element);
+        gobu->variant_destroy(&element);
+
         if (!result) return false;
     }
-    
+
     return true;
 }
 
-static bool encode_dictionary(EncoderBuffer* buf, const Variant* dict_variant) {
+static bool encode_dictionary(EncoderBuffer* buf, const GobuVariant* dict_variant) {
     // Get keys array
-    Variant keys_variant;
-    if (!get_dictionary_keys(dict_variant, &keys_variant)) {
-        return false;
+    GobuVariant keys_variant;
+    gobu->dictionary_keys(dict_variant, &keys_variant);
+
+    int64_t size = gobu->variant_size(&keys_variant);
+    bool result = encode_map_header(buf, (size_t)size);
+
+    for (int64_t i = 0; result && i < size; i++) {
+        GobuVariant key;
+        result = gobu->variant_get_indexed(&keys_variant, i, &key);
+
+        // Encode key, then its value
+        const GobuVariant* value = result ? gobu->dictionary_find(dict_variant, &key) : NULL;
+        result = value && encode_variant(buf, &key) && encode_variant(buf, value);
+        gobu->variant_destroy(&key);
     }
-    
-    int64_t size = get_array_size(&keys_variant);
-    
-    if (!encode_map_header(buf, (size_t)size)) {
-        destructors.variant_destroy(&keys_variant);
-        return false;
-    }
-    
-    for (int64_t i = 0; i < size; i++) {
-        Variant key;
-        if (!get_array_element(&keys_variant, i, &key)) {
-            destructors.variant_destroy(&keys_variant);
-            return false;
-        }
-        
-        // Encode key
-        if (!encode_variant(buf, &key)) {
-            destructors.variant_destroy(&key);
-            destructors.variant_destroy(&keys_variant);
-            return false;
-        }
-        
-        // Get and encode value
-        Variant value;
-        if (!get_dictionary_value(dict_variant, &key, &value)) {
-            destructors.variant_destroy(&key);
-            destructors.variant_destroy(&keys_variant);
-            return false;
-        }
-        
-        bool result = encode_variant(buf, &value);
-        
-        destructors.variant_destroy(&key);
-        destructors.variant_destroy(&value);
-        
-        if (!result) {
-            destructors.variant_destroy(&keys_variant);
-            return false;
-        }
-    }
-    
-    destructors.variant_destroy(&keys_variant);
-    return true;
+
+    gobu->variant_destroy(&keys_variant);
+    return result;
 }
 
 // ============================================================================
 // Main variant encoding
 // ============================================================================
 
-static bool encode_variant(EncoderBuffer* buf, const Variant* variant) {
-    NativeExtensionVariantType type = api.variant_get_type(variant);
-    
+static bool encode_variant(EncoderBuffer* buf, const GobuVariant* variant) {
+    const int32_t type = gobu->variant_get_type(variant);
+
     switch (type) {
-        case NATIVEEXTENSION_VARIANT_TYPE_NIL:
+        case GOBU_TYPE_NIL:
             return encode_nil(buf);
-            
-        case NATIVEEXTENSION_VARIANT_TYPE_BOOL: {
-            NativeExtensionBool value;
-            // Extract bool from variant
-            NativeExtensionTypeFromVariantConstructorFunc bool_from_variant = 
-                (NativeExtensionTypeFromVariantConstructorFunc)constructors.int_from_variant_constructor;
-            // Actually, we need to check the variant value
-            // For bool, we can use int extraction and check
-            int64_t int_val = 0;
-            constructors.int_from_variant_constructor(&int_val, variant);
-            return encode_bool(buf, int_val != 0);
-        }
-            
-        case NATIVEEXTENSION_VARIANT_TYPE_INT: {
-            int64_t value;
-            constructors.int_from_variant_constructor(&value, variant);
-            return encode_int(buf, value);
-        }
-            
-        case NATIVEEXTENSION_VARIANT_TYPE_FLOAT: {
-            double value = 0.0;
-            constructors.float_from_variant_constructor(&value, variant);
-            return encode_float(buf, value);
-        }
-            
-        case NATIVEEXTENSION_VARIANT_TYPE_STRING:
+
+        case GOBU_TYPE_BOOL:
+            return encode_bool(buf, gobu->variant_to_bool(variant));
+
+        case GOBU_TYPE_INT:
+            return encode_int(buf, gobu->variant_to_int(variant));
+
+        case GOBU_TYPE_FLOAT:
+            return encode_float(buf, gobu->variant_to_float(variant));
+
+        case GOBU_TYPE_STRING:
+        case GOBU_TYPE_STRING_NAME:  // A StringName key of a Dictionary (as a script may write one)
             return encode_gobu_string(buf, variant);
-            
-        case NATIVEEXTENSION_VARIANT_TYPE_STRING_NAME: {
-            // A StringName key of a Dictionary (as a script may write one)
-            // Use variant_stringify to convert StringName variant directly to String
-            String str;
-            api.variant_stringify(variant, &str);
-            
-            // Get string length
-            int32_t length = api.string_to_utf8_chars(&str, NULL, 0);
-            if (length <= 0) {
-                destructors.string_destructor(&str);
-                return encode_string(buf, "", 0);
-            }
-            
-            // Allocate buffer and extract string
-            char* buffer = (char*)malloc(length + 1);
-            if (!buffer) {
-                destructors.string_destructor(&str);
-                return false;
-            }
-            
-            api.string_to_utf8_chars(&str, buffer, length);
-            buffer[length] = '\0';
-            
-            bool result = encode_string(buf, buffer, (size_t)length);
-            
-            free(buffer);
-            destructors.string_destructor(&str);
-            return result;
-        }
-            
-        case NATIVEEXTENSION_VARIANT_TYPE_PACKED_BYTE_ARRAY:
+
+        case GOBU_TYPE_PACKED_BYTE_ARRAY:
             return encode_packed_byte_array(buf, variant);
-            
-        case NATIVEEXTENSION_VARIANT_TYPE_ARRAY:
+
+        case GOBU_TYPE_ARRAY:
             return encode_array(buf, variant);
-            
-        case NATIVEEXTENSION_VARIANT_TYPE_DICTIONARY:
+
+        case GOBU_TYPE_DICTIONARY:
             return encode_dictionary(buf, variant);
-            
+
         default:
             // Unsupported type - encode as nil
-            printf("[msgpack_encoder] Warning: unsupported variant type %d, encoding as nil\n", type);
+            printf("[msgpack_encoder] Warning: unsupported variant type %d, encoding as nil\n", (int)type);
             fflush(stdout);
             return encode_nil(buf);
     }
@@ -579,26 +389,26 @@ static bool encode_variant(EncoderBuffer* buf, const Variant* variant) {
 // Public API
 // ============================================================================
 
-uint8_t* gobu_variant_to_msgpack(const Variant* variant, size_t* out_length) {
+uint8_t* gobu_variant_to_msgpack(const GobuVariant* variant, size_t* out_length) {
     if (!variant || !out_length) {
         if (out_length) *out_length = 0;
         return NULL;
     }
-    
+
     EncoderBuffer buf;
     if (!buffer_init(&buf)) {
         *out_length = 0;
         return NULL;
     }
-    
+
     if (!encode_variant(&buf, variant)) {
         buffer_free(&buf);
         *out_length = 0;
         return NULL;
     }
-    
+
     *out_length = buf.size;
-    
+
     // Transfer ownership of buffer to caller
     // Shrink to exact size to avoid waste
     if (buf.size < buf.capacity) {
@@ -607,6 +417,6 @@ uint8_t* gobu_variant_to_msgpack(const Variant* variant, size_t* out_length) {
             return result;
         }
     }
-    
+
     return buf.data;
 }

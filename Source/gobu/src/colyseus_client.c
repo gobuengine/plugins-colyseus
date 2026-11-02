@@ -22,16 +22,15 @@
 #endif
 #endif
 
-// HTTP event queue type (needed by destructor, full definition below)
+// HTTP event queue — thread-safe, processed in poll()
 typedef struct gobuext_http_event {
     int is_error;
     int64_t request_id;
     int status_or_code;
     char* body_or_message;
-    NativeExtensionObjectPtr client_object;
+    GobuObjectId client_id;  // The _ColyseusClient: resolved on the main thread, it may be gone by then
     struct gobuext_http_event* next;
 } gobuext_http_event_t;
-static gobuext_http_event_t* http_event_pop(void);
 
 // Room event queue — thread-safe, processed in poll()
 typedef enum {
@@ -46,7 +45,7 @@ typedef enum {
 
 typedef struct gobuext_room_event {
     gobuext_room_event_type_t type;
-    NativeExtensionObjectPtr room_object;
+    GobuObjectId room_id;   // The _ColyseusRoom: resolved on the main thread, it may be gone by then
     int code;               // for error/leave
     char* str_data;         // message (error/leave reason), or message type
     uint8_t* binary_data;   // message payload (msgpack)
@@ -56,34 +55,6 @@ typedef struct gobuext_room_event {
 
 static void room_event_push(gobuext_room_event_t* event);
 static gobuext_room_event_t* room_event_pop(void);
-
-// Helper function to create a Gobu String from a C string
-static void string_from_c_str(String *p_dest, const char *p_src) {
-    if (p_src == NULL) {
-        constructors.string_new_with_utf8_chars(p_dest, "");
-    } else {
-        constructors.string_new_with_utf8_chars(p_dest, p_src);
-    }
-}
-
-// Helper function to convert Gobu String to C string (caller must free)
-static char* string_to_c_str(const String *p_src) {
-    if (!p_src) return strdup("");
-    
-    // Get string length
-    int32_t length = api.string_to_utf8_chars(p_src, NULL, 0);
-    if (length <= 0) return strdup("");
-    
-    // Allocate buffer (+1 for null terminator)
-    char* buffer = (char*)malloc(length + 1);
-    if (!buffer) return strdup("");
-    
-    // Extract string
-    api.string_to_utf8_chars(p_src, buffer, length);
-    buffer[length] = '\0';
-    
-    return buffer;
-}
 
 // Helper to parse endpoint string (e.g., "ws://localhost:2567")
 static void parse_endpoint(const char* endpoint, char** address, char** port, bool* use_secure) {
@@ -144,40 +115,22 @@ static void on_room_state_change(void* userdata);
 static void on_room_error(int code, const char* message, void* userdata);
 static void on_room_leave(int code, const char* reason, void* userdata);
 
-NativeExtensionObjectPtr gobuext_colyseus_client_constructor(void* p_class_userdata) {
+void* gobuext_colyseus_client_create_instance(void* p_class_userdata, GobuObject* p_object) {
     (void)p_class_userdata;
-    
-    // Create the Gobu Object (construct parent class)
-    StringName class_name;
-    constructors.string_name_new_with_latin1_chars(&class_name, "RefCounted", false);
-    
-    NativeExtensionObjectPtr object = api.classdb_construct_object(&class_name);
-    destructors.string_name_destructor(&class_name);
-    
-    if (!object) return NULL;
-    
-    // Create our wrapper instance data
-    ColyseusClientWrapper* wrapper = (ColyseusClientWrapper*)malloc(sizeof(ColyseusClientWrapper));
-    if (!wrapper) return NULL;
-    
-    wrapper->native_client = NULL;
-    wrapper->gobu_object = object;
 
-    // Attach our wrapper to the Gobu object
-    StringName class_name2;
-    constructors.string_name_new_with_latin1_chars(&class_name2, "_ColyseusClient", false);
-    api.object_set_instance(object, &class_name2, wrapper);
-    destructors.string_name_destructor(&class_name2);
-    
-    return object;
+    ColyseusClientWrapper* wrapper = (ColyseusClientWrapper*)calloc(1, sizeof(ColyseusClientWrapper));
+    if (!wrapper) return NULL;
+    wrapper->object_id = gobu->object_get_instance_id(p_object);
+    return wrapper;
 }
 
-void gobuext_colyseus_client_destructor(void* p_class_userdata, NativeExtensionClassInstancePtr p_instance) {
+void gobuext_colyseus_client_free_instance(void* p_class_userdata, void* p_instance) {
     (void)p_class_userdata;
 
     ColyseusClientWrapper* wrapper = (ColyseusClientWrapper*)p_instance;
     if (wrapper) {
-        // Wait for in-flight HTTP requests to complete
+        // Wait for in-flight HTTP requests to complete (their threads use the native client). What they
+        // queued finds the client gone, and is dropped.
         int wait_ms = 0;
         while (wrapper->pending_http_requests > 0 && wait_ms < 2000) {
             #ifdef _WIN32
@@ -188,16 +141,6 @@ void gobuext_colyseus_client_destructor(void* p_class_userdata, NativeExtensionC
             wait_ms += 10;
         }
 
-        // Drain any queued events for this client (discard — object is being freed)
-        gobuext_http_event_t* event;
-        while ((event = http_event_pop()) != NULL) {
-            free(event->body_or_message);
-            free(event);
-        }
-
-        // Invalidate gobu_object
-        wrapper->gobu_object = NULL;
-
         if (wrapper->native_client) {
             colyseus_client_free(wrapper->native_client);
         }
@@ -205,146 +148,54 @@ void gobuext_colyseus_client_destructor(void* p_class_userdata, NativeExtensionC
     }
 }
 
-// Reference counting for RefCounted base class
-void gobuext_colyseus_client_reference(void* p_class_userdata, NativeExtensionClassInstancePtr p_instance) {
-    (void)p_class_userdata;
-    (void)p_instance;
-    // For RefCounted, Gobu manages the reference count internally
-    // We don't need to do anything here
-}
+// set_endpoint(endpoint: String): "ws://localhost:2567", "wss://example.com"...
+GOBUEXT_METHOD(gobuext_colyseus_client_set_endpoint) {
+    (void)p_method_userdata; (void)p_argument_count; (void)r_return; (void)r_error;
 
-void gobuext_colyseus_client_unreference(void* p_class_userdata, NativeExtensionClassInstancePtr p_instance) {
-    (void)p_class_userdata;
-    (void)p_instance;
-    // For RefCounted, Gobu manages the reference count internally
-    // We don't need to do anything here
-}
-
-void gobuext_colyseus_client_set_endpoint(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstTypePtr* p_args, NativeExtensionTypePtr r_ret) {
-    (void)p_method_userdata;
-    (void)r_ret;
-    
-    const String* endpoint = (const String*)p_args[0];
     ColyseusClientWrapper* wrapper = (ColyseusClientWrapper*)p_instance;
     if (!wrapper) return;
-    
-    char* endpoint_str = string_to_c_str(endpoint);
+
+    char* endpoint_str = gobuext_to_utf8(p_args[0]);
     if (!endpoint_str) return;
-    
+
     // Parse endpoint and create settings
     char* address = NULL;
     char* port = NULL;
     bool use_secure = false;
     parse_endpoint(endpoint_str, &address, &port, &use_secure);
-    
+
     // Create settings
     colyseus_settings_t* settings = colyseus_settings_create();
     colyseus_settings_set_address(settings, address);
     colyseus_settings_set_port(settings, port);
     colyseus_settings_set_secure(settings, use_secure);
-    
+
     // Set CA certificates for TLS verification (auto-loaded at init time)
     const unsigned char* ca_data = gobuext_tls_get_ca_certificates();
     size_t ca_len = gobuext_tls_get_ca_certificates_len();
     if (ca_data && ca_len > 0) {
         colyseus_settings_set_ca_certificates(settings, ca_data, ca_len);
     }
-    
+
     // Create native client
     if (wrapper->native_client) {
         colyseus_client_free(wrapper->native_client);
     }
     wrapper->native_client = colyseus_client_create(settings);
-    
+
     // Cleanup
     free(endpoint_str);
     free(address);
     free(port);
 }
 
-// Simple getter - reference implementation style
-const char* gobuext_colyseus_client_get_endpoint(const ColyseusClientWrapper* self) {
-    if (self && self->native_client && self->native_client->settings) {
-        // Note: This returns a pointer to the settings structure data
-        // The string is managed by the settings object and should not be freed by the caller
-        return self->native_client->settings->server_address;
-    }
-    return "";
-}
+// get_endpoint() -> String: the server's address
+GOBUEXT_METHOD(gobuext_colyseus_client_get_endpoint) {
+    (void)p_method_userdata; (void)p_args; (void)p_argument_count; (void)r_error;
 
-// NativeExtension ptrcall wrapper for get_endpoint (raw type return)
-void gobuext_colyseus_client_get_endpoint_ptrcall(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstTypePtr* p_args, NativeExtensionTypePtr r_ret) {
-    (void)p_method_userdata;
-    (void)p_args;
-    
     const ColyseusClientWrapper* self = (const ColyseusClientWrapper*)p_instance;
-    if (self && r_ret) {
-        const char* endpoint = gobuext_colyseus_client_get_endpoint(self);
-        string_from_c_str((String*)r_ret, endpoint);
-    }
-}
-
-// NativeExtension call wrapper for get_endpoint (Variant return)
-void gobuext_colyseus_client_get_endpoint_call(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstVariantPtr* p_args, NativeExtensionInt p_argument_count, NativeExtensionVariantPtr r_return, NativeExtensionCallError* r_error) {
-    (void)p_method_userdata;
-    (void)p_args;
-    (void)p_argument_count;
-    (void)r_error;
-    
-    const ColyseusClientWrapper* self = (const ColyseusClientWrapper*)p_instance;
-    if (self && r_return) {
-        const char* endpoint = gobuext_colyseus_client_get_endpoint(self);
-        String result_string;
-        string_from_c_str(&result_string, endpoint);
-        constructors.variant_from_string_constructor(r_return, &result_string);
-        destructors.string_destructor(&result_string);
-    }
-}
-
-// Helper function to emit Gobu signals via call_deferred
-// This ensures signals are emitted on the main thread, avoiding thread safety issues
-static void emit_signal(NativeExtensionObjectPtr object, const char* signal_name, NativeExtensionConstVariantPtr* args, int arg_count) {
-    if (!object) return;
-
-    Variant object_variant;
-    constructors.variant_from_object_constructor(&object_variant, &object);
-
-    // Use call_deferred because WebSocket callbacks fire from a background thread.
-    // Gobu APIs are not thread-safe, so we must defer to the main thread.
-    StringName call_deferred_method;
-    constructors.string_name_new_with_latin1_chars(&call_deferred_method, "call_deferred", false);
-
-    // First arg to call_deferred is the method name "emit_signal"
-    String emit_signal_str;
-    constructors.string_new_with_utf8_chars(&emit_signal_str, "emit_signal");
-    Variant emit_signal_variant;
-    constructors.variant_from_string_constructor(&emit_signal_variant, &emit_signal_str);
-
-    // Second arg to call_deferred is the signal name
-    String signal_string;
-    constructors.string_new_with_utf8_chars(&signal_string, signal_name);
-    Variant signal_name_variant;
-    constructors.variant_from_string_constructor(&signal_name_variant, &signal_string);
-
-    // Build args array: ["emit_signal", signal_name, ...args]
-    NativeExtensionConstVariantPtr call_args[16];
-    call_args[0] = &emit_signal_variant;
-    call_args[1] = &signal_name_variant;
-    for (int i = 0; i < arg_count && i < 14; i++) {
-        call_args[i + 2] = args[i];
-    }
-
-    Variant return_value;
-    NativeExtensionCallError error;
-    api.variant_call(&object_variant, &call_deferred_method, call_args, arg_count + 2, &return_value, &error);
-
-    destructors.string_name_destructor(&call_deferred_method);
-    destructors.string_destructor(&emit_signal_str);
-    destructors.variant_destroy(&emit_signal_variant);
-    destructors.string_destructor(&signal_string);
-    destructors.variant_destroy(&signal_name_variant);
-    destructors.variant_destroy(&return_value);
-    destructors.variant_destroy(&object_variant);
+    gobuext_new_string(r_return, self && self->native_client && self->native_client->settings
+        ? self->native_client->settings->server_address : NULL);
 }
 
 // =============================================================================
@@ -353,12 +204,12 @@ static void emit_signal(NativeExtensionObjectPtr object, const char* signal_name
 
 static void on_room_message_with_type(const char* type, const uint8_t* data, size_t length, void* userdata) {
     ColyseusRoomWrapper* room_wrapper = (ColyseusRoomWrapper*)userdata;
-    if (!room_wrapper || !room_wrapper->gobu_object) return;
+    if (!room_wrapper || !room_wrapper->object_id) return;
 
     gobuext_room_event_t* event = (gobuext_room_event_t*)calloc(1, sizeof(gobuext_room_event_t));
     if (!event) return;
     event->type = ROOM_EVENT_MESSAGE;
-    event->room_object = room_wrapper->gobu_object;
+    event->room_id = room_wrapper->object_id;
     event->str_data = type ? strdup(type) : strdup("");
     if (data && length > 0) {
         event->binary_data = (uint8_t*)malloc(length);
@@ -372,34 +223,34 @@ static void on_room_message_with_type(const char* type, const uint8_t* data, siz
 
 static void on_room_join(void* userdata) {
     ColyseusRoomWrapper* room_wrapper = (ColyseusRoomWrapper*)userdata;
-    if (!room_wrapper || !room_wrapper->gobu_object) return;
+    if (!room_wrapper || !room_wrapper->object_id) return;
 
     gobuext_room_event_t* event = (gobuext_room_event_t*)calloc(1, sizeof(gobuext_room_event_t));
     if (!event) return;
     event->type = ROOM_EVENT_JOIN;
-    event->room_object = room_wrapper->gobu_object;
+    event->room_id = room_wrapper->object_id;
     room_event_push(event);
 }
 
 static void on_room_state_change(void* userdata) {
     ColyseusRoomWrapper* room_wrapper = (ColyseusRoomWrapper*)userdata;
-    if (!room_wrapper || !room_wrapper->gobu_object) return;
+    if (!room_wrapper || !room_wrapper->object_id) return;
 
     gobuext_room_event_t* event = (gobuext_room_event_t*)calloc(1, sizeof(gobuext_room_event_t));
     if (!event) return;
     event->type = ROOM_EVENT_STATE_CHANGE;
-    event->room_object = room_wrapper->gobu_object;
+    event->room_id = room_wrapper->object_id;
     room_event_push(event);
 }
 
 static void on_room_error(int code, const char* message, void* userdata) {
     ColyseusRoomWrapper* room_wrapper = (ColyseusRoomWrapper*)userdata;
-    if (!room_wrapper || !room_wrapper->gobu_object) return;
+    if (!room_wrapper || !room_wrapper->object_id) return;
 
     gobuext_room_event_t* event = (gobuext_room_event_t*)calloc(1, sizeof(gobuext_room_event_t));
     if (!event) return;
     event->type = ROOM_EVENT_ERROR;
-    event->room_object = room_wrapper->gobu_object;
+    event->room_id = room_wrapper->object_id;
     event->code = code;
     event->str_data = message ? strdup(message) : strdup("");
     room_event_push(event);
@@ -407,12 +258,12 @@ static void on_room_error(int code, const char* message, void* userdata) {
 
 static void on_room_leave(int code, const char* reason, void* userdata) {
     ColyseusRoomWrapper* room_wrapper = (ColyseusRoomWrapper*)userdata;
-    if (!room_wrapper || !room_wrapper->gobu_object) return;
+    if (!room_wrapper || !room_wrapper->object_id) return;
 
     gobuext_room_event_t* event = (gobuext_room_event_t*)calloc(1, sizeof(gobuext_room_event_t));
     if (!event) return;
     event->type = ROOM_EVENT_LEAVE;
-    event->room_object = room_wrapper->gobu_object;
+    event->room_id = room_wrapper->object_id;
     event->code = code;
     event->str_data = reason ? strdup(reason) : strdup("");
     room_event_push(event);
@@ -420,12 +271,12 @@ static void on_room_leave(int code, const char* reason, void* userdata) {
 
 static void on_room_drop(int code, const char* reason, void* userdata) {
     ColyseusRoomWrapper* room_wrapper = (ColyseusRoomWrapper*)userdata;
-    if (!room_wrapper || !room_wrapper->gobu_object) return;
+    if (!room_wrapper || !room_wrapper->object_id) return;
 
     gobuext_room_event_t* event = (gobuext_room_event_t*)calloc(1, sizeof(gobuext_room_event_t));
     if (!event) return;
     event->type = ROOM_EVENT_DROP;
-    event->room_object = room_wrapper->gobu_object;
+    event->room_id = room_wrapper->object_id;
     event->code = code;
     event->str_data = reason ? strdup(reason) : strdup("");
     room_event_push(event);
@@ -433,12 +284,12 @@ static void on_room_drop(int code, const char* reason, void* userdata) {
 
 static void on_room_reconnect(void* userdata) {
     ColyseusRoomWrapper* room_wrapper = (ColyseusRoomWrapper*)userdata;
-    if (!room_wrapper || !room_wrapper->gobu_object) return;
+    if (!room_wrapper || !room_wrapper->object_id) return;
 
     gobuext_room_event_t* event = (gobuext_room_event_t*)calloc(1, sizeof(gobuext_room_event_t));
     if (!event) return;
     event->type = ROOM_EVENT_RECONNECT;
-    event->room_object = room_wrapper->gobu_object;
+    event->room_id = room_wrapper->object_id;
     room_event_push(event);
 }
 
@@ -485,49 +336,29 @@ typedef void (*matchmaking_with_options_fn)(colyseus_client_t*, const char*, con
 typedef void (*matchmaking_reconnect_fn)(colyseus_client_t*, const char*,
     colyseus_client_room_callback_t, colyseus_client_error_callback_t, void*);
 
-// Common ptrcall implementation for matchmaking methods with options (join_or_create, create, join, join_by_id)
-// p_args[0] = String (room name / room id), p_args[1] = String (options JSON)
-static void matchmaking_ptrcall_with_options(NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstTypePtr* p_args, NativeExtensionTypePtr r_ret, matchmaking_with_options_fn native_fn) {
+// A new _ColyseusRoom in `r_return` (which holds it), and its data; NULL if it could not be made.
+static ColyseusRoomWrapper* new_room(GobuVariant* r_return) {
+    if (!gobu->classdb_instantiate("_ColyseusRoom", r_return)) {
+        return NULL;
+    }
+    return gobuext_colyseus_room_get_wrapper(gobu->variant_to_object(r_return));
+}
+
+// The matchmaking methods with options (join_or_create, create, join, join_by_id): the room comes back at
+// once, and joins (or fails) later. p_args[0] = room name / room id, p_args[1] = options JSON.
+static void matchmaking_with_options(void* p_instance, const GobuVariant* const* p_args, GobuVariant* r_return,
+    matchmaking_with_options_fn native_fn) {
     ColyseusClientWrapper* client_wrapper = (ColyseusClientWrapper*)p_instance;
     if (!client_wrapper || !client_wrapper->native_client) {
-        if (r_ret) {
-            *(NativeExtensionObjectPtr*)r_ret = NULL;
-        }
-        return;
+        return;  // null
     }
-
-    // p_args[0] = room name / room id, p_args[1] = options JSON string
-    const String* arg_string = (const String*)p_args[0];
-    char* arg_cstr = string_to_c_str(arg_string);
-
-    const String* options_string = (const String*)p_args[1];
-    char* options_cstr = string_to_c_str(options_string);
-
-    // Create a ColyseusRoom Gobu object
-    StringName class_name;
-    constructors.string_name_new_with_latin1_chars(&class_name, "_ColyseusRoom", false);
-
-    NativeExtensionObjectPtr room_object = api.classdb_construct_object(&class_name);
-    destructors.string_name_destructor(&class_name);
-
-    if (!room_object) {
-        free(arg_cstr);
-        free(options_cstr);
-        if (r_ret) {
-            *(NativeExtensionObjectPtr*)r_ret = NULL;
-        }
-        return;
-    }
-
-    // Get the wrapper that was created by the constructor
-    ColyseusRoomWrapper* room_wrapper = gobuext_colyseus_room_get_last_wrapper();
+    ColyseusRoomWrapper* room_wrapper = new_room(r_return);
     if (!room_wrapper) {
-        free(arg_cstr);
-        free(options_cstr);
         return;
     }
 
-    // Call the native matchmaking function (async)
+    char* arg_cstr = gobuext_to_utf8(p_args[0]);
+    char* options_cstr = gobuext_to_utf8(p_args[1]);
     native_fn(
         client_wrapper->native_client,
         arg_cstr,
@@ -536,66 +367,45 @@ static void matchmaking_ptrcall_with_options(NativeExtensionClassInstancePtr p_i
         on_matchmaking_error,
         room_wrapper
     );
-
-    // For RefCounted objects, call reference() to keep the object alive when returning
-    {
-        StringName ref_method;
-        constructors.string_name_new_with_latin1_chars(&ref_method, "reference", false);
-
-        Variant room_variant;
-        constructors.variant_from_object_constructor(&room_variant, &room_object);
-
-        Variant return_val;
-        NativeExtensionCallError call_error;
-        api.variant_call(&room_variant, &ref_method, NULL, 0, &return_val, &call_error);
-
-        destructors.string_name_destructor(&ref_method);
-        destructors.variant_destroy(&return_val);
-        destructors.variant_destroy(&room_variant);
-    }
-
-    // Return the room object
-    if (r_ret) {
-        *(NativeExtensionObjectPtr*)r_ret = room_object;
-    }
-
     free(arg_cstr);
     free(options_cstr);
 }
 
-// Common ptrcall implementation for reconnect (no options parameter)
-static void matchmaking_ptrcall_reconnect(NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstTypePtr* p_args, NativeExtensionTypePtr r_ret, matchmaking_reconnect_fn native_fn) {
+GOBUEXT_METHOD(gobuext_colyseus_client_join_or_create) {
+    (void)p_method_userdata; (void)p_argument_count; (void)r_error;
+    matchmaking_with_options(p_instance, p_args, r_return, colyseus_client_join_or_create);
+}
+
+GOBUEXT_METHOD(gobuext_colyseus_client_create) {
+    (void)p_method_userdata; (void)p_argument_count; (void)r_error;
+    matchmaking_with_options(p_instance, p_args, r_return, colyseus_client_create_room);
+}
+
+GOBUEXT_METHOD(gobuext_colyseus_client_join) {
+    (void)p_method_userdata; (void)p_argument_count; (void)r_error;
+    matchmaking_with_options(p_instance, p_args, r_return, colyseus_client_join);
+}
+
+GOBUEXT_METHOD(gobuext_colyseus_client_join_by_id) {
+    (void)p_method_userdata; (void)p_argument_count; (void)r_error;
+    matchmaking_with_options(p_instance, p_args, r_return, colyseus_client_join_by_id);
+}
+
+// reconnect(reconnection_token: String): the seat the server holds with allowReconnection()
+GOBUEXT_METHOD(gobuext_colyseus_client_reconnect) {
+    (void)p_method_userdata; (void)p_argument_count; (void)r_error;
+
     ColyseusClientWrapper* client_wrapper = (ColyseusClientWrapper*)p_instance;
     if (!client_wrapper || !client_wrapper->native_client) {
-        if (r_ret) {
-            *(NativeExtensionObjectPtr*)r_ret = NULL;
-        }
-        return;
+        return;  // null
     }
-
-    const String* token_string = (const String*)p_args[0];
-    char* token_cstr = string_to_c_str(token_string);
-
-    StringName class_name;
-    constructors.string_name_new_with_latin1_chars(&class_name, "_ColyseusRoom", false);
-
-    NativeExtensionObjectPtr room_object = api.classdb_construct_object(&class_name);
-    destructors.string_name_destructor(&class_name);
-
-    if (!room_object) {
-        free(token_cstr);
-        if (r_ret) {
-            *(NativeExtensionObjectPtr*)r_ret = NULL;
-        }
-        return;
-    }
-
-    ColyseusRoomWrapper* room_wrapper = gobuext_colyseus_room_get_last_wrapper();
+    ColyseusRoomWrapper* room_wrapper = new_room(r_return);
     if (!room_wrapper) {
-        free(token_cstr);
         return;
     }
 
+    char* token_cstr = gobuext_to_utf8(p_args[0]);
+    matchmaking_reconnect_fn native_fn = colyseus_client_reconnect;
     native_fn(
         client_wrapper->native_client,
         token_cstr,
@@ -603,150 +413,7 @@ static void matchmaking_ptrcall_reconnect(NativeExtensionClassInstancePtr p_inst
         on_matchmaking_error,
         room_wrapper
     );
-
-    {
-        StringName ref_method;
-        constructors.string_name_new_with_latin1_chars(&ref_method, "reference", false);
-
-        Variant room_variant;
-        constructors.variant_from_object_constructor(&room_variant, &room_object);
-
-        Variant return_val;
-        NativeExtensionCallError call_error;
-        api.variant_call(&room_variant, &ref_method, NULL, 0, &return_val, &call_error);
-
-        destructors.string_name_destructor(&ref_method);
-        destructors.variant_destroy(&return_val);
-        destructors.variant_destroy(&room_variant);
-    }
-
-    if (r_ret) {
-        *(NativeExtensionObjectPtr*)r_ret = room_object;
-    }
-
     free(token_cstr);
-}
-
-// Common call wrapper: extracts args from Variants, delegates to ptrcall function
-typedef void (*matchmaking_ptrcall_fn)(void*, NativeExtensionClassInstancePtr, const NativeExtensionConstTypePtr*, NativeExtensionTypePtr);
-
-// The ptrcall versions return the room with a reference of their own (taken with reference()),
-// for callers that adopt it. The Variant made here holds its own one, so release that extra one,
-// or the room is never freed.
-static void release_ptrcall_reference(NativeExtensionObjectPtr p_object) {
-    if (!p_object) {
-        return;
-    }
-    Variant object_variant;
-    constructors.variant_from_object_constructor(&object_variant, &p_object);
-    StringName unreference;
-    constructors.string_name_new_with_latin1_chars(&unreference, "unreference", false);
-    Variant ignored;
-    NativeExtensionCallError call_error;
-    api.variant_call(&object_variant, &unreference, NULL, 0, &ignored, &call_error);
-    destructors.variant_destroy(&ignored);
-    destructors.string_name_destructor(&unreference);
-    destructors.variant_destroy(&object_variant);
-}
-
-// Call wrapper for methods with 1 String arg + optional options JSON (defaults to "{}")
-static void matchmaking_call_wrapper_2(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstVariantPtr* p_args, NativeExtensionInt p_argument_count, NativeExtensionVariantPtr r_return, matchmaking_ptrcall_fn ptrcall_fn) {
-    String arg0_string, arg1_string;
-    constructors.string_from_variant_constructor(&arg0_string, (NativeExtensionVariantPtr)p_args[0]);
-
-    if (p_argument_count >= 2) {
-        constructors.string_from_variant_constructor(&arg1_string, (NativeExtensionVariantPtr)p_args[1]);
-    } else {
-        constructors.string_new_with_utf8_chars(&arg1_string, "{}");
-    }
-
-    NativeExtensionConstTypePtr ptrcall_args[2] = {
-        (NativeExtensionConstTypePtr)&arg0_string,
-        (NativeExtensionConstTypePtr)&arg1_string,
-    };
-
-    NativeExtensionObjectPtr result = NULL;
-    ptrcall_fn(p_method_userdata, p_instance, ptrcall_args, &result);
-
-    if (r_return) {
-        constructors.variant_from_object_constructor(r_return, &result);
-    }
-    release_ptrcall_reference(result);
-
-    destructors.string_destructor(&arg0_string);
-    destructors.string_destructor(&arg1_string);
-}
-
-// Call wrapper for methods with 1 String arg (reconnect token)
-static void matchmaking_call_wrapper_1(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstVariantPtr* p_args, NativeExtensionVariantPtr r_return, matchmaking_ptrcall_fn ptrcall_fn) {
-    String arg_string;
-    constructors.string_from_variant_constructor(&arg_string, (NativeExtensionVariantPtr)p_args[0]);
-
-    NativeExtensionConstTypePtr ptrcall_args[1] = { (NativeExtensionConstTypePtr)&arg_string };
-
-    NativeExtensionObjectPtr result = NULL;
-    ptrcall_fn(p_method_userdata, p_instance, ptrcall_args, &result);
-
-    if (r_return) {
-        constructors.variant_from_object_constructor(r_return, &result);
-    }
-    release_ptrcall_reference(result);
-
-    destructors.string_destructor(&arg_string);
-}
-
-// =============================================================================
-// Matchmaking method implementations
-// =============================================================================
-
-// join_or_create(room_name: String, options_json: String)
-void gobuext_colyseus_client_join_or_create_ptrcall(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstTypePtr* p_args, NativeExtensionTypePtr r_ret) {
-    (void)p_method_userdata;
-    matchmaking_ptrcall_with_options(p_instance, p_args, r_ret, colyseus_client_join_or_create);
-}
-void gobuext_colyseus_client_join_or_create(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstVariantPtr* p_args, NativeExtensionInt p_argument_count, NativeExtensionVariantPtr r_return, NativeExtensionCallError* r_error) {
-    (void)r_error;
-    matchmaking_call_wrapper_2(p_method_userdata, p_instance, p_args, p_argument_count, r_return, gobuext_colyseus_client_join_or_create_ptrcall);
-}
-
-// create(room_name: String, options_json: String)
-void gobuext_colyseus_client_create_ptrcall(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstTypePtr* p_args, NativeExtensionTypePtr r_ret) {
-    (void)p_method_userdata;
-    matchmaking_ptrcall_with_options(p_instance, p_args, r_ret, colyseus_client_create_room);
-}
-void gobuext_colyseus_client_create(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstVariantPtr* p_args, NativeExtensionInt p_argument_count, NativeExtensionVariantPtr r_return, NativeExtensionCallError* r_error) {
-    (void)r_error;
-    matchmaking_call_wrapper_2(p_method_userdata, p_instance, p_args, p_argument_count, r_return, gobuext_colyseus_client_create_ptrcall);
-}
-
-// join(room_name: String, options_json: String)
-void gobuext_colyseus_client_join_ptrcall(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstTypePtr* p_args, NativeExtensionTypePtr r_ret) {
-    (void)p_method_userdata;
-    matchmaking_ptrcall_with_options(p_instance, p_args, r_ret, colyseus_client_join);
-}
-void gobuext_colyseus_client_join(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstVariantPtr* p_args, NativeExtensionInt p_argument_count, NativeExtensionVariantPtr r_return, NativeExtensionCallError* r_error) {
-    (void)r_error;
-    matchmaking_call_wrapper_2(p_method_userdata, p_instance, p_args, p_argument_count, r_return, gobuext_colyseus_client_join_ptrcall);
-}
-
-// join_by_id(room_id: String, options_json: String)
-void gobuext_colyseus_client_join_by_id_ptrcall(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstTypePtr* p_args, NativeExtensionTypePtr r_ret) {
-    (void)p_method_userdata;
-    matchmaking_ptrcall_with_options(p_instance, p_args, r_ret, colyseus_client_join_by_id);
-}
-void gobuext_colyseus_client_join_by_id(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstVariantPtr* p_args, NativeExtensionInt p_argument_count, NativeExtensionVariantPtr r_return, NativeExtensionCallError* r_error) {
-    (void)r_error;
-    matchmaking_call_wrapper_2(p_method_userdata, p_instance, p_args, p_argument_count, r_return, gobuext_colyseus_client_join_by_id_ptrcall);
-}
-
-// reconnect(reconnection_token: String)
-void gobuext_colyseus_client_reconnect_ptrcall(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstTypePtr* p_args, NativeExtensionTypePtr r_ret) {
-    (void)p_method_userdata;
-    matchmaking_ptrcall_reconnect(p_instance, p_args, r_ret, colyseus_client_reconnect);
-}
-void gobuext_colyseus_client_reconnect(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance, const NativeExtensionConstVariantPtr* p_args, NativeExtensionInt p_argument_count, NativeExtensionVariantPtr r_return, NativeExtensionCallError* r_error) {
-    (void)p_argument_count; (void)r_error;
-    matchmaking_call_wrapper_1(p_method_userdata, p_instance, p_args, r_return, gobuext_colyseus_client_reconnect_ptrcall);
 }
 
 // =============================================================================
@@ -842,7 +509,7 @@ typedef struct {
     char* body;
     int method;  // 0=GET, 1=POST, 2=PUT, 3=DELETE, 4=PATCH, 5=an auth operation (auth_op)
     int64_t request_id;
-    NativeExtensionObjectPtr client_object;
+    GobuObjectId client_id;
     ColyseusClientWrapper* wrapper;  // For decrementing pending count
     // An auth operation (colyseus.gro's _AUTH_*: the order is the ABI); `body` is its options' JSON.
     colyseus_auth_t* auth;
@@ -890,7 +557,7 @@ static void on_gobuext_http_success(const colyseus_http_response_t* response, vo
     event->request_id = req->request_id;
     event->status_or_code = response->status_code;
     event->body_or_message = response->body ? strdup(response->body) : strdup("");
-    event->client_object = req->client_object;
+    event->client_id = req->client_id;
     http_event_push(event);
     gobuext_http_request_answered(req);
 }
@@ -905,7 +572,7 @@ static void on_gobuext_http_error(const colyseus_http_error_t* error, void* user
     event->request_id = req->request_id;
     event->status_or_code = error->code;
     event->body_or_message = error->message ? strdup(error->message) : strdup("");
-    event->client_object = req->client_object;
+    event->client_id = req->client_id;
     http_event_push(event);
     gobuext_http_request_answered(req);
 }
@@ -926,7 +593,7 @@ static void on_gobuext_auth_success(const colyseus_auth_data_t* data, void* user
         event->request_id = req->request_id;
         event->status_or_code = 200;
         event->body_or_message = body;
-        event->client_object = req->client_object;
+        event->client_id = req->client_id;
         http_event_push(event);
     } else {
         free(body);
@@ -943,7 +610,7 @@ static void on_gobuext_auth_error(const char* message, void* userdata) {
         event->request_id = req->request_id;
         event->status_or_code = 0;  // The SDK's auth reports only a message.
         event->body_or_message = strdup(message ? message : "");
-        event->client_object = req->client_object;
+        event->client_id = req->client_id;
         http_event_push(event);
     }
     gobuext_http_request_answered(req);
@@ -1015,7 +682,7 @@ static int64_t gobuext_http_dispatch_full(ColyseusClientWrapper* wrapper, int me
     req->body = body && body[0] ? strdup(body) : NULL;
     req->method = method;
     req->request_id = g_http_request_counter;
-    req->client_object = wrapper->gobu_object;
+    req->client_id = wrapper->object_id;
     req->wrapper = wrapper;
     req->auth = wrapper->native_client->auth;
     req->auth_op = auth_op;
@@ -1048,167 +715,99 @@ static int64_t gobuext_http_dispatch(ColyseusClientWrapper* wrapper, int method,
 // HTTP event processing — called from poll() on main thread
 // =============================================================================
 
-// Helper: emit signal directly on main thread (NOT call_deferred)
-static void emit_signal_direct(NativeExtensionObjectPtr object, const char* signal_name, NativeExtensionConstVariantPtr* args, int arg_count) {
+// Emits a signal of the object of `p_id`, if it is still alive. It is kept alive while the signal's handlers
+// run (they may drop the game's last reference).
+static void emit_signal_of(GobuObjectId p_id, const char* p_signal, const GobuVariant* const* p_args, int64_t p_arg_count) {
+    GobuObject* object = gobu->object_from_instance_id(p_id);
     if (!object) return;
 
-    Variant obj_variant;
-    constructors.variant_from_object_constructor(&obj_variant, &object);
-    StringName emit_method;
-    constructors.string_name_new_with_latin1_chars(&emit_method, "emit_signal", false);
-    String sig_str;
-    string_from_c_str(&sig_str, signal_name);
-    Variant sig_variant;
-    constructors.variant_from_string_constructor(&sig_variant, &sig_str);
-
-    NativeExtensionConstVariantPtr emit_args[16];
-    emit_args[0] = &sig_variant;
-    for (int i = 0; i < arg_count && i < 15; i++) {
-        emit_args[i + 1] = args[i];
-    }
-
-    Variant ret;
-    NativeExtensionCallError err;
-    api.variant_call(&obj_variant, &emit_method, emit_args, arg_count + 1, &ret, &err);
-
-    destructors.string_name_destructor(&emit_method);
-    destructors.string_destructor(&sig_str);
-    destructors.variant_destroy(&sig_variant);
-    destructors.variant_destroy(&ret);
-    destructors.variant_destroy(&obj_variant);
+    GobuVariant keep;
+    gobu->variant_new_object(&keep, object);
+    gobu->object_emit_signal(object, p_signal, p_args, p_arg_count);
+    gobu->variant_destroy(&keep);
 }
 
-void gobuext_http_process_events(void) {
+// A signal (code: int, text: String): error, left, dropped, and the HTTP ones' last two
+static void emit_code_and_text(GobuObjectId p_id, const char* p_signal, const GobuVariant* p_first, int64_t p_code, const char* p_text) {
+    GobuVariant code;
+    GobuVariant text;
+    gobu->variant_new_int(&code, p_code);
+    gobuext_new_string(&text, p_text);
+    if (p_first) {
+        const GobuVariant* args[3] = { p_first, &code, &text };
+        emit_signal_of(p_id, p_signal, args, 3);
+    } else {
+        const GobuVariant* args[2] = { &code, &text };
+        emit_signal_of(p_id, p_signal, args, 2);
+    }
+    gobu->variant_destroy(&code);
+    gobu->variant_destroy(&text);
+}
+
+static void gobuext_http_process_events(void) {
     gobuext_http_event_t* event;
     while ((event = http_event_pop()) != NULL) {
-        if (event->client_object) {
-            int64_t rid = event->request_id;
-            Variant rid_variant;
-            constructors.variant_from_int_constructor(&rid_variant, &rid);
-
-            int64_t code = event->status_or_code;
-            Variant code_variant;
-            constructors.variant_from_int_constructor(&code_variant, &code);
-
-            String str;
-            string_from_c_str(&str, event->body_or_message ? event->body_or_message : "");
-            Variant str_variant;
-            constructors.variant_from_string_constructor(&str_variant, &str);
-
-            const char* signal_name = event->is_error ? "_http_error" : "_http_response";
-            NativeExtensionConstVariantPtr args[3] = { &rid_variant, &code_variant, &str_variant };
-            emit_signal_direct(event->client_object, signal_name, args, 3);
-
-            destructors.variant_destroy(&rid_variant);
-            destructors.variant_destroy(&code_variant);
-            destructors.string_destructor(&str);
-            destructors.variant_destroy(&str_variant);
-        }
+        GobuVariant request_id;
+        gobu->variant_new_int(&request_id, event->request_id);
+        emit_code_and_text(event->client_id, event->is_error ? "_http_error" : "_http_response", &request_id,
+            event->status_or_code, event->body_or_message);
+        gobu->variant_destroy(&request_id);
 
         free(event->body_or_message);
         free(event);
     }
 }
 
-void gobuext_room_process_events(void) {
+static void gobuext_room_process_events(void) {
     gobuext_room_event_t* event;
     while ((event = room_event_pop()) != NULL) {
-        if (!event->room_object) {
-            room_event_free(event);
-            continue;
-        }
-
         switch (event->type) {
             case ROOM_EVENT_JOIN:
-                emit_signal_direct(event->room_object, "joined", NULL, 0);
+                emit_signal_of(event->room_id, "joined", NULL, 0);
                 break;
 
             case ROOM_EVENT_STATE_CHANGE:
-                emit_signal_direct(event->room_object, "state_changed", NULL, 0);
+                emit_signal_of(event->room_id, "state_changed", NULL, 0);
                 break;
 
-            case ROOM_EVENT_ERROR: {
-                int64_t code = event->code;
-                Variant code_variant;
-                constructors.variant_from_int_constructor(&code_variant, &code);
-                String msg;
-                string_from_c_str(&msg, event->str_data ? event->str_data : "");
-                Variant msg_variant;
-                constructors.variant_from_string_constructor(&msg_variant, &msg);
-
-                NativeExtensionConstVariantPtr args[2] = { &code_variant, &msg_variant };
-                emit_signal_direct(event->room_object, "error", args, 2);
-
-                destructors.variant_destroy(&code_variant);
-                destructors.string_destructor(&msg);
-                destructors.variant_destroy(&msg_variant);
+            case ROOM_EVENT_ERROR:
+                emit_code_and_text(event->room_id, "error", NULL, event->code, event->str_data);
                 break;
-            }
 
-            case ROOM_EVENT_LEAVE: {
-                int64_t code = event->code;
-                Variant code_variant;
-                constructors.variant_from_int_constructor(&code_variant, &code);
-                String reason;
-                string_from_c_str(&reason, event->str_data ? event->str_data : "");
-                Variant reason_variant;
-                constructors.variant_from_string_constructor(&reason_variant, &reason);
-
-                NativeExtensionConstVariantPtr args[2] = { &code_variant, &reason_variant };
-                emit_signal_direct(event->room_object, "left", args, 2);
-
-                destructors.variant_destroy(&code_variant);
-                destructors.string_destructor(&reason);
-                destructors.variant_destroy(&reason_variant);
+            case ROOM_EVENT_LEAVE:
+                emit_code_and_text(event->room_id, "left", NULL, event->code, event->str_data);
                 break;
-            }
 
-            case ROOM_EVENT_DROP: {
-                int64_t code = event->code;
-                Variant code_variant;
-                constructors.variant_from_int_constructor(&code_variant, &code);
-                String reason;
-                string_from_c_str(&reason, event->str_data ? event->str_data : "");
-                Variant reason_variant;
-                constructors.variant_from_string_constructor(&reason_variant, &reason);
-
-                NativeExtensionConstVariantPtr args[2] = { &code_variant, &reason_variant };
-                emit_signal_direct(event->room_object, "dropped", args, 2);
-
-                destructors.variant_destroy(&code_variant);
-                destructors.string_destructor(&reason);
-                destructors.variant_destroy(&reason_variant);
+            case ROOM_EVENT_DROP:
+                emit_code_and_text(event->room_id, "dropped", NULL, event->code, event->str_data);
                 break;
-            }
 
             case ROOM_EVENT_RECONNECT:
-                emit_signal_direct(event->room_object, "reconnected", NULL, 0);
+                emit_signal_of(event->room_id, "reconnected", NULL, 0);
                 break;
 
             case ROOM_EVENT_MESSAGE: {
                 // Decode msgpack on main thread
-                String type_str;
-                string_from_c_str(&type_str, event->str_data ? event->str_data : "");
-                Variant type_variant;
-                constructors.variant_from_string_constructor(&type_variant, &type_str);
+                GobuVariant type;
+                gobuext_new_string(&type, event->str_data);
 
-                Variant data_variant;
+                GobuVariant data;
                 bool decoded = false;
                 if (event->binary_data && event->binary_len > 0) {
-                    decoded = msgpack_to_gobu_variant(event->binary_data, event->binary_len, &data_variant);
+                    decoded = msgpack_to_gobu_variant(event->binary_data, event->binary_len, &data);
+                    if (!decoded) {
+                        gobu->variant_destroy(&data);
+                    }
                 }
                 if (!decoded) {
-                    // Fallback: nil variant
-                    int64_t zero = 0;
-                    constructors.variant_from_int_constructor(&data_variant, &zero);
+                    gobu->variant_new_int(&data, 0);
                 }
 
-                NativeExtensionConstVariantPtr args[2] = { &type_variant, &data_variant };
-                emit_signal_direct(event->room_object, "message_received", args, 2);
+                const GobuVariant* args[2] = { &type, &data };
+                emit_signal_of(event->room_id, "message_received", args, 2);
 
-                destructors.string_destructor(&type_str);
-                destructors.variant_destroy(&type_variant);
-                destructors.variant_destroy(&data_variant);
+                gobu->variant_destroy(&type);
+                gobu->variant_destroy(&data);
                 break;
             }
         }
@@ -1217,136 +816,61 @@ void gobuext_room_process_events(void) {
     }
 }
 
+// The SDK's network (websocket_transport.c; on the web, its polling of the browser's requests)
+extern void colyseus_http_poll(void);
+extern void colyseus_ws_poll(void);
+
+// Static poll(): runs the network and emits the queued events' signals, on the main thread
+GOBUEXT_METHOD(gobuext_colyseus_client_poll) {
+    (void)p_method_userdata; (void)p_instance; (void)p_args;
+    (void)p_argument_count; (void)r_return; (void)r_error;
+    colyseus_http_poll();
+    colyseus_ws_poll();
+    gobuext_http_process_events();
+    gobuext_room_process_events();
+}
+
 // =============================================================================
-// HTTP NativeExtension method implementations (vararg — path, [body], callable)
+// HTTP methods (path, [body]) -> request id
 // =============================================================================
+
+// An HTTP request of `p_method` (0=GET, 1=POST, 2=PUT, 3=DELETE, 4=PATCH): its id, or 0 without a client.
+static void http_request(void* p_instance, const GobuVariant* const* p_args, bool p_has_body, int p_method, GobuVariant* r_return) {
+    char* path = gobuext_to_utf8(p_args[0]);
+    char* body = p_has_body ? gobuext_to_utf8(p_args[1]) : NULL;
+    gobu->variant_new_int(r_return, gobuext_http_dispatch((ColyseusClientWrapper*)p_instance, p_method, path, body));
+    free(path);
+    free(body);
+}
 
 // http_get(path: String) -> int (request_id)
-void gobuext_colyseus_client_http_get(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance,
-    const NativeExtensionConstVariantPtr* p_args, NativeExtensionInt p_argument_count,
-    NativeExtensionVariantPtr r_return, NativeExtensionCallError* r_error) {
-    (void)p_method_userdata; (void)r_error;
-    ColyseusClientWrapper* wrapper = (ColyseusClientWrapper*)p_instance;
-    if (!wrapper || p_argument_count < 1) return;
-
-    String path_string;
-    constructors.string_from_variant_constructor(&path_string, (NativeExtensionVariantPtr)p_args[0]);
-    char* path = string_to_c_str(&path_string);
-
-    int64_t rid = gobuext_http_dispatch(wrapper, 0, path, NULL);
-
-    if (r_return) {
-        constructors.variant_from_int_constructor(r_return, &rid);
-    }
-
-    destructors.string_destructor(&path_string);
-    free(path);
+GOBUEXT_METHOD(gobuext_colyseus_client_http_get) {
+    (void)p_method_userdata; (void)p_argument_count; (void)r_error;
+    http_request(p_instance, p_args, false, 0, r_return);
 }
 
 // http_post(path: String, body: String) -> int
-void gobuext_colyseus_client_http_post(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance,
-    const NativeExtensionConstVariantPtr* p_args, NativeExtensionInt p_argument_count,
-    NativeExtensionVariantPtr r_return, NativeExtensionCallError* r_error) {
-    (void)p_method_userdata; (void)r_error;
-    ColyseusClientWrapper* wrapper = (ColyseusClientWrapper*)p_instance;
-    if (!wrapper || p_argument_count < 2) return;
-
-    String path_string;
-    constructors.string_from_variant_constructor(&path_string, (NativeExtensionVariantPtr)p_args[0]);
-    char* path = string_to_c_str(&path_string);
-
-    String body_string;
-    constructors.string_from_variant_constructor(&body_string, (NativeExtensionVariantPtr)p_args[1]);
-    char* body = string_to_c_str(&body_string);
-
-    int64_t rid = gobuext_http_dispatch(wrapper, 1, path, body);
-
-    if (r_return) {
-        constructors.variant_from_int_constructor(r_return, &rid);
-    }
-
-    destructors.string_destructor(&path_string);
-    destructors.string_destructor(&body_string);
-    free(path);
-    free(body);
+GOBUEXT_METHOD(gobuext_colyseus_client_http_post) {
+    (void)p_method_userdata; (void)p_argument_count; (void)r_error;
+    http_request(p_instance, p_args, true, 1, r_return);
 }
 
 // http_put(path: String, body: String) -> int
-void gobuext_colyseus_client_http_put(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance,
-    const NativeExtensionConstVariantPtr* p_args, NativeExtensionInt p_argument_count,
-    NativeExtensionVariantPtr r_return, NativeExtensionCallError* r_error) {
-    (void)p_method_userdata; (void)r_error;
-    ColyseusClientWrapper* wrapper = (ColyseusClientWrapper*)p_instance;
-    if (!wrapper || p_argument_count < 2) return;
-
-    String path_string;
-    constructors.string_from_variant_constructor(&path_string, (NativeExtensionVariantPtr)p_args[0]);
-    char* path = string_to_c_str(&path_string);
-
-    String body_string;
-    constructors.string_from_variant_constructor(&body_string, (NativeExtensionVariantPtr)p_args[1]);
-    char* body = string_to_c_str(&body_string);
-
-    int64_t rid = gobuext_http_dispatch(wrapper, 2, path, body);
-
-    if (r_return) {
-        constructors.variant_from_int_constructor(r_return, &rid);
-    }
-
-    destructors.string_destructor(&path_string);
-    destructors.string_destructor(&body_string);
-    free(path);
-    free(body);
+GOBUEXT_METHOD(gobuext_colyseus_client_http_put) {
+    (void)p_method_userdata; (void)p_argument_count; (void)r_error;
+    http_request(p_instance, p_args, true, 2, r_return);
 }
 
 // http_delete(path: String) -> int
-void gobuext_colyseus_client_http_delete(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance,
-    const NativeExtensionConstVariantPtr* p_args, NativeExtensionInt p_argument_count,
-    NativeExtensionVariantPtr r_return, NativeExtensionCallError* r_error) {
-    (void)p_method_userdata; (void)r_error;
-    ColyseusClientWrapper* wrapper = (ColyseusClientWrapper*)p_instance;
-    if (!wrapper || p_argument_count < 1) return;
-
-    String path_string;
-    constructors.string_from_variant_constructor(&path_string, (NativeExtensionVariantPtr)p_args[0]);
-    char* path = string_to_c_str(&path_string);
-
-    int64_t rid = gobuext_http_dispatch(wrapper, 3, path, NULL);
-
-    if (r_return) {
-        constructors.variant_from_int_constructor(r_return, &rid);
-    }
-
-    destructors.string_destructor(&path_string);
-    free(path);
+GOBUEXT_METHOD(gobuext_colyseus_client_http_delete) {
+    (void)p_method_userdata; (void)p_argument_count; (void)r_error;
+    http_request(p_instance, p_args, false, 3, r_return);
 }
 
 // http_patch(path: String, body: String) -> int
-void gobuext_colyseus_client_http_patch(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance,
-    const NativeExtensionConstVariantPtr* p_args, NativeExtensionInt p_argument_count,
-    NativeExtensionVariantPtr r_return, NativeExtensionCallError* r_error) {
-    (void)p_method_userdata; (void)r_error;
-    ColyseusClientWrapper* wrapper = (ColyseusClientWrapper*)p_instance;
-    if (!wrapper || p_argument_count < 2) return;
-
-    String path_string;
-    constructors.string_from_variant_constructor(&path_string, (NativeExtensionVariantPtr)p_args[0]);
-    char* path = string_to_c_str(&path_string);
-
-    String body_string;
-    constructors.string_from_variant_constructor(&body_string, (NativeExtensionVariantPtr)p_args[1]);
-    char* body = string_to_c_str(&body_string);
-
-    int64_t rid = gobuext_http_dispatch(wrapper, 4, path, body);
-
-    if (r_return) {
-        constructors.variant_from_int_constructor(r_return, &rid);
-    }
-
-    destructors.string_destructor(&path_string);
-    destructors.string_destructor(&body_string);
-    free(path);
-    free(body);
+GOBUEXT_METHOD(gobuext_colyseus_client_http_patch) {
+    (void)p_method_userdata; (void)p_argument_count; (void)r_error;
+    http_request(p_instance, p_args, true, 4, r_return);
 }
 
 // =============================================================================
@@ -1354,69 +878,51 @@ void gobuext_colyseus_client_http_patch(void* p_method_userdata, NativeExtension
 // =============================================================================
 
 // auth_set_token(token: String)
-void gobuext_colyseus_client_auth_set_token(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance,
-    const NativeExtensionConstTypePtr* p_args, NativeExtensionTypePtr r_ret) {
-    (void)p_method_userdata; (void)r_ret;
+GOBUEXT_METHOD(gobuext_colyseus_client_auth_set_token) {
+    (void)p_method_userdata; (void)p_argument_count; (void)r_return; (void)r_error;
     ColyseusClientWrapper* wrapper = (ColyseusClientWrapper*)p_instance;
     if (!wrapper || !wrapper->native_client || !wrapper->native_client->http) return;
 
-    const String* token_string = (const String*)p_args[0];
-    char* token = string_to_c_str(token_string);
+    char* token = gobuext_to_utf8(p_args[0]);
     colyseus_http_set_auth_token(wrapper->native_client->http, token);
     free(token);
 }
 
 // auth_request(op: int, email: String, password: String, options_json: String) -> int: an auth operation of
 // colyseus.gro (_AUTH_*), answered by _http_response / _http_error as an HTTP request.
-void gobuext_colyseus_client_auth_request(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance,
-    const NativeExtensionConstVariantPtr* p_args, NativeExtensionInt p_argument_count,
-    NativeExtensionVariantPtr r_return, NativeExtensionCallError* r_error) {
-    (void)p_method_userdata; (void)r_error;
-    ColyseusClientWrapper* wrapper = (ColyseusClientWrapper*)p_instance;
-    if (!wrapper || !wrapper->native_client || p_argument_count < 4) return;
+GOBUEXT_METHOD(gobuext_colyseus_client_auth_request) {
+    (void)p_method_userdata; (void)p_argument_count; (void)r_error;
 
-    int64_t op = 0;
-    constructors.int_from_variant_constructor(&op, (NativeExtensionVariantPtr)p_args[0]);
-    String texts[3];
-    char* values[3];
-    for (int i = 0; i < 3; i++) {
-        constructors.string_from_variant_constructor(&texts[i], (NativeExtensionVariantPtr)p_args[i + 1]);
-        values[i] = string_to_c_str(&texts[i]);
-    }
+    const int64_t op = gobu->variant_to_int(p_args[0]);
+    char* email = gobuext_to_utf8(p_args[1]);
+    char* password = gobuext_to_utf8(p_args[2]);
+    char* options = gobuext_to_utf8(p_args[3]);
 
-    int64_t rid = gobuext_http_dispatch_full(wrapper, 5, "", values[2], (int)op, values[0], values[1]);
-    if (r_return) {
-        constructors.variant_from_int_constructor(r_return, &rid);
-    }
+    const int64_t rid = gobuext_http_dispatch_full((ColyseusClientWrapper*)p_instance, 5, "", options, (int)op, email, password);
+    gobu->variant_new_int(r_return, rid);
 
-    for (int i = 0; i < 3; i++) {
-        destructors.string_destructor(&texts[i]);
-        free(values[i]);
-    }
+    free(email);
+    free(password);
+    free(options);
 }
 
 // auth_signout(): forgets the token, here and in the secure storage. No request.
-void gobuext_colyseus_client_auth_signout(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance,
-    const NativeExtensionConstTypePtr* p_args, NativeExtensionTypePtr r_ret) {
-    (void)p_method_userdata; (void)p_args; (void)r_ret;
+GOBUEXT_METHOD(gobuext_colyseus_client_auth_signout) {
+    (void)p_method_userdata; (void)p_args; (void)p_argument_count; (void)r_return; (void)r_error;
     ColyseusClientWrapper* wrapper = (ColyseusClientWrapper*)p_instance;
     if (wrapper && wrapper->native_client && wrapper->native_client->auth) {
         colyseus_auth_signout(wrapper->native_client->auth);
     }
 }
 
-// auth_get_token() -> String
-void gobuext_colyseus_client_auth_get_token(void* p_method_userdata, NativeExtensionClassInstancePtr p_instance,
-    const NativeExtensionConstTypePtr* p_args, NativeExtensionTypePtr r_ret) {
-    (void)p_method_userdata; (void)p_args;
+// auth_get_token() -> String: "" when signed out
+GOBUEXT_METHOD(gobuext_colyseus_client_auth_get_token) {
+    (void)p_method_userdata; (void)p_args; (void)p_argument_count; (void)r_error;
     ColyseusClientWrapper* wrapper = (ColyseusClientWrapper*)p_instance;
-    if (!wrapper || !r_ret) return;
 
-    const char* token = "";
-    if (wrapper->native_client && wrapper->native_client->http) {
-        const char* t = colyseus_http_get_auth_token(wrapper->native_client->http);
-        if (t) token = t;
+    const char* token = NULL;
+    if (wrapper && wrapper->native_client && wrapper->native_client->http) {
+        token = colyseus_http_get_auth_token(wrapper->native_client->http);
     }
-
-    string_from_c_str((String*)r_ret, token);
+    gobuext_new_string(r_return, token);
 }

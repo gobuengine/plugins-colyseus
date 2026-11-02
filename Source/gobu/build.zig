@@ -3,7 +3,6 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const gobu_double_precision = b.option(bool, "gobu-double-precision", "Build against a double-precision Gobu engine") orelse false;
 
     const os_tag = target.result.os.tag;
 
@@ -35,7 +34,6 @@ pub fn build(b: *std.Build) void {
     };
 
     const build_type = if (optimize == .Debug) "debug" else "release";
-    const gobu_precision_flag: ?[]const u8 = if (gobu_double_precision) "-DREAL_T_IS_DOUBLE" else null;
 
     // Build library name based on platform
     // macOS uses universal binaries, others include architecture
@@ -164,10 +162,10 @@ pub fn build(b: *std.Build) void {
 
             // C source files for web (uses web-specific transport and http, no wslay)
             const c_sources = [_][]const u8{
-                // Gobu extension sources
+                // The plugin's sources
                 "src/plugin.c",
                 "src/colyseus_provider.c",
-                "src/gobu_compat.c",
+                "src/gobu_values.c",
                 "src/colyseus_client.c",
                 "src/colyseus_room.c",
                 "src/colyseus_callbacks.c",
@@ -258,13 +256,13 @@ pub fn build(b: *std.Build) void {
             // C flags and defines
             emcc.addArgs(&.{
                 "-DPLATFORM_WEB",
-                "-DNATIVEEXTENSION_SIDE_MODULE",
+                "-DCOLYSEUS_SIDE_MODULE",
             });
 
             // Output path for the WASM file
             const wasm_output = b.fmt("zig-out/bin/lib{s}.wasm", .{lib_name});
 
-            // Emscripten flags for NativeExtension side module
+            // Emscripten flags for a side module (a Gobu plugin on the web)
             // Note: Don't use ASYNCIFY - Gobu's main module handles async operations
             emcc.addArgs(&.{
                 "-o",
@@ -360,19 +358,19 @@ pub fn build(b: *std.Build) void {
             },
         });
 
-        // Create the shared library for the NativeExtension
+        // Create the shared library: the Gobu plugin
         const lib = b.addLibrary(.{
             .name = lib_name,
             .root_module = lib_module,
             .linkage = .dynamic,
         });
 
-        // Add C source files - Gobu extension sources
+        // Add C source files - the plugin's sources
         lib.root_module.addCSourceFiles(.{
             .files = &.{
                 "src/plugin.c",
                 "src/colyseus_provider.c",
-                "src/gobu_compat.c",
+                "src/gobu_values.c",
                 "src/colyseus_client.c",
                 "src/colyseus_room.c",
                 "src/colyseus_callbacks.c",
@@ -387,7 +385,6 @@ pub fn build(b: *std.Build) void {
                 "-Wall",
                 "-Wextra",
                 "-Wno-unused-parameter",
-                if (gobu_precision_flag) |flag| flag else "",
             },
         });
 
@@ -431,7 +428,6 @@ pub fn build(b: *std.Build) void {
                 "-Wextra",
                 "-Wno-unused-parameter",
                 "-DHAVE_CONFIG_H",
-                if (gobu_precision_flag) |flag| flag else "",
             },
         });
 
@@ -756,7 +752,7 @@ pub fn build(b: *std.Build) void {
                 // sysroot lets it link the real bionic libc. This does two things:
                 //   1. The .so gets a NEEDED libc.so, fixing the dlopen "cannot
                 //      locate symbol malloc" loader failure (Gobu loads
-                //      NativeExtensions with RTLD_LOCAL, so the namespace won't
+                //      plugins with RTLD_LOCAL, so the namespace won't
                 //      borrow libc from the host process).
                 //   2. builtin.link_libc becomes true, so std.net resolves DNS
                 //      via bionic getaddrinfo instead of its own /etc/resolv.conf

@@ -12,16 +12,9 @@ static size_t g_ca_pem_len = 0;
 static unsigned char* g_loaded_pem_data = NULL;  /* Dynamically loaded data (must be freed) */
 static bool g_initialized = false;
 
-/* Function pointers for Gobu API (set during init) */
-static NativeExtensionInterfaceGlobalGetSingleton global_get_singleton = NULL;
-
 /* Forward declarations */
 static bool load_certificates_from_gobu_path(const char* path);
 static char* get_project_settings_override_path(void);
-
-void gobuext_tls_certificates_set_api(NativeExtensionInterfaceGetProcAddress p_get_proc_address) {
-    global_get_singleton = (NativeExtensionInterfaceGlobalGetSingleton)p_get_proc_address("global_get_singleton");
-}
 
 void gobuext_tls_certificates_init(void) {
     if (g_initialized) {
@@ -71,67 +64,37 @@ size_t gobuext_tls_get_ca_certificates_len(void) {
  * String. Returns a malloc'd UTF-8 string (caller frees), or NULL on any error
  * or non-String result. */
 static char* call_project_settings_string_method(const char* method_name, const char* arg_utf8) {
-    if (!global_get_singleton) {
-        return NULL;
-    }
-
-    StringName project_settings_name;
-    constructors.string_name_new_with_latin1_chars(&project_settings_name, "ProjectSettings", false);
-
-    NativeExtensionObjectPtr project_settings = global_get_singleton(&project_settings_name);
-    destructors.string_name_destructor(&project_settings_name);
-
+    GobuObject* project_settings = gobu->get_singleton("ProjectSettings");
     if (!project_settings) {
         return NULL;
     }
 
-    Variant settings_variant;
-    constructors.variant_from_object_constructor(&settings_variant, &project_settings);
-
-    StringName method;
-    constructors.string_name_new_with_latin1_chars(&method, method_name, false);
-
-    String arg_str;
-    constructors.string_new_with_utf8_chars(&arg_str, arg_utf8);
-    Variant arg_variant;
-    constructors.variant_from_string_constructor(&arg_variant, &arg_str);
-
-    NativeExtensionConstVariantPtr args[1] = { &arg_variant };
-    Variant result;
-    NativeExtensionCallError error;
-    api.variant_call(&settings_variant, &method, args, 1, &result, &error);
+    GobuVariant arg_variant;
+    gobuext_new_string(&arg_variant, arg_utf8);
+    const GobuVariant* args[1] = { &arg_variant };
+    GobuVariant result;
+    GobuCallError error = { 0, 0, 0 };
+    gobu->object_call(project_settings, method_name, args, 1, &result, &error);
 
     char* result_str = NULL;
-
-    if (error.error == NATIVEEXTENSION_CALL_OK &&
-        api.variant_get_type(&result) == NATIVEEXTENSION_VARIANT_TYPE_STRING) {
-        String result_string;
-        constructors.string_from_variant_constructor(&result_string, &result);
-
-        int32_t length = api.string_to_utf8_chars(&result_string, NULL, 0);
-        if (length > 0) {
-            result_str = (char*)malloc(length + 1);
-            if (result_str) {
-                api.string_to_utf8_chars(&result_string, result_str, length);
-                result_str[length] = '\0';
-            }
-        }
-
-        destructors.string_destructor(&result_string);
+    if (error.error == GOBU_CALL_OK && gobu->variant_get_type(&result) == GOBU_TYPE_STRING) {
+        result_str = gobuext_to_utf8(&result);
     }
 
-    destructors.variant_destroy(&result);
-    destructors.string_destructor(&arg_str);
-    destructors.variant_destroy(&arg_variant);
-    destructors.string_name_destructor(&method);
-    destructors.variant_destroy(&settings_variant);
-
+    gobu->variant_destroy(&result);
+    gobu->variant_destroy(&arg_variant);
     return result_str;
 }
 
-/* Get the certificate bundle override path from ProjectSettings */
+/* Get the certificate bundle override path from ProjectSettings (NULL when it is not set) */
 static char* get_project_settings_override_path(void) {
-    return call_project_settings_string_method("get_setting", "network/tls/certificate_bundle_override");
+    GobuVariant value;
+    char* path = NULL;
+    if (gobu->get_setting("network/tls/certificate_bundle_override", &value) && gobu->variant_get_type(&value) == GOBU_TYPE_STRING) {
+        path = gobuext_to_utf8(&value);
+    }
+    gobu->variant_destroy(&value);
+    return path;
 }
 
 /* Load certificates from a Gobu resource path (res:// or user://) or an

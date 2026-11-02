@@ -260,7 +260,7 @@ impl Callbacks {
 				return result
 			}
 		}
-		push_error("Colyseus: ColyseusCallbacks not available. Make sure the native extension is properly loaded.")
+		push_error("Colyseus: ColyseusCallbacks not available. Make sure the Colyseus plugin is enabled (Project Settings > Plugins).")
 		return result
 	}
 
@@ -1037,7 +1037,7 @@ impl Client {
 			client.native = ClassDB.instantiate(class_name_str)
 		}
 		if client.native == null {
-			push_error("Colyseus: ColyseusClient not available. Make sure the native extension is properly loaded.")
+			push_error("Colyseus: ColyseusClient not available. Make sure the Colyseus plugin is enabled (Project Settings > Plugins).")
 			return client
 		}
 

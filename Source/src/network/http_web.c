@@ -10,7 +10,7 @@
 // ============================================================================
 // SIDE_MODULE (Gobu) - Uses polling approach since JS can't callback to C
 // ============================================================================
-#ifdef NATIVEEXTENSION_SIDE_MODULE
+#ifdef COLYSEUS_SIDE_MODULE
 
 typedef struct {
     int request_id;
@@ -342,7 +342,7 @@ static void http_fetch_request(
     free(full_url);
 }
 
-#endif /* NATIVEEXTENSION_SIDE_MODULE */
+#endif /* COLYSEUS_SIDE_MODULE */
 
 colyseus_http_t* colyseus_http_create(const colyseus_settings_t* settings) {
     colyseus_http_t* http = malloc(sizeof(colyseus_http_t));

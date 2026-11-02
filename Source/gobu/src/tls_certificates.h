@@ -2,17 +2,10 @@
 #define COLYSEUS_TLS_CERTIFICATES_H
 
 #include <stddef.h>
-#include <nativeextension_interface.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/**
- * Set the NativeExtension API function for accessing singletons.
- * Must be called from colyseus_sdk_init() before gobuext_tls_certificates_init().
- */
-void gobuext_tls_certificates_set_api(NativeExtensionInterfaceGetProcAddress p_get_proc_address);
 
 /**
  * Initialize TLS certificates for the Gobu platform.
@@ -21,13 +14,13 @@ void gobuext_tls_certificates_set_api(NativeExtensionInterfaceGetProcAddress p_g
  * If found, it loads certificates from that file.
  * Otherwise, it uses the bundled Mozilla CA certificates.
  * 
- * Should be called during extension initialization.
+ * Called from gobu_plugin_init() (plugin.c).
  */
 void gobuext_tls_certificates_init(void);
 
 /**
  * Clean up TLS certificates.
- * Should be called during extension deinitialization.
+ * Called when the plugin is deinitialized.
  */
 void gobuext_tls_certificates_cleanup(void);
 

@@ -30,7 +30,7 @@ extern "C" {
  * @note The caller is responsible for freeing the returned buffer
  * @note Returns NULL and sets out_length to 0 on encoding error
  */
-uint8_t* gobu_variant_to_msgpack(const Variant* variant, size_t* out_length);
+uint8_t* gobu_variant_to_msgpack(const GobuVariant* variant, size_t* out_length);
 
 #ifdef __cplusplus
 }

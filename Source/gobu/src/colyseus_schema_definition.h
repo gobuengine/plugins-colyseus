@@ -28,7 +28,7 @@ struct colyseus_schema_definition {
 };
 
 /* NULL when the value is not a schema definition. */
-colyseus_schema_definition_t* colyseus_schema_definition_create(NativeExtensionConstVariantPtr definition);
+colyseus_schema_definition_t* colyseus_schema_definition_create(const GobuVariant* definition);
 /* With its nested schemas. */
 void colyseus_schema_definition_free(colyseus_schema_definition_t* definition);
 

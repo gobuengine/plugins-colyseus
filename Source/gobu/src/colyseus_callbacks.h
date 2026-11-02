@@ -24,7 +24,7 @@ typedef enum {
 // Callback entry - stores the script's callable and related info
 typedef struct {
     colyseus_callback_handle_t handle;  // Native callback handle
-    Variant callable;                    // The script's Callable, stored as a Variant
+    GobuVariant callable;                // The script's Callable
     int ref_id;                          // Schema reference ID (0 for root state)
     char* property;                      // Property name (owned)
     ColyseusGobuCallbackType type;      // Callback type
@@ -33,91 +33,42 @@ typedef struct {
     const colyseus_schema_vtable_t* item_vtable;  // For collections: vtable of items
 } GobuCallbackEntry;
 
-// ColyseusCallbacks wrapper
+// The data of a _ColyseusCallbacks
 typedef struct {
     colyseus_callbacks_t* native_callbacks;  // Native callbacks manager
     ColyseusRoomWrapper* room_wrapper;       // Reference to room
-    NativeExtensionObjectPtr gobu_object;       // Gobu object pointer
     GobuCallbackEntry entries[COLYSEUS_MAX_CALLBACK_ENTRIES];
     int entry_count;
 } ColyseusCallbacksWrapper;
 
-// Constructor/destructor
-NativeExtensionObjectPtr gobuext_colyseus_callbacks_constructor(void* p_class_userdata);
-void gobuext_colyseus_callbacks_destructor(void* p_class_userdata, NativeExtensionClassInstancePtr p_instance);
+void* gobuext_colyseus_callbacks_create_instance(void* p_class_userdata, GobuObject* p_object);
+void gobuext_colyseus_callbacks_free_instance(void* p_class_userdata, void* p_instance);
 
-// Static factory method: ColyseusCallbacks.get(room)
-void gobuext_colyseus_callbacks_get(
-    void* p_method_userdata,
-    NativeExtensionClassInstancePtr p_instance,
-    const NativeExtensionConstVariantPtr* p_args,
-    NativeExtensionInt p_argument_count,
-    NativeExtensionVariantPtr r_return,
-    NativeExtensionCallError* r_error
-);
+// Static get(room) -> _ColyseusCallbacks: the callbacks of a joined room's state
+GOBUEXT_METHOD(gobuext_colyseus_callbacks_get);
 
-// Instance methods
+// Each returns a handle for remove(), or -1.
 
 // listen(target, property_or_callback, [callback]) -> int
 // - listen("property", callback) - root state
 // - listen(schema_dict, "property", callback) - nested schema
-void gobuext_colyseus_callbacks_listen(
-    void* p_method_userdata,
-    NativeExtensionClassInstancePtr p_instance,
-    const NativeExtensionConstVariantPtr* p_args,
-    NativeExtensionInt p_argument_count,
-    NativeExtensionVariantPtr r_return,
-    NativeExtensionCallError* r_error
-);
+GOBUEXT_METHOD(gobuext_colyseus_callbacks_listen);
 
-// on_add(target, property_or_callback, [callback]) -> int
-void gobuext_colyseus_callbacks_on_add(
-    void* p_method_userdata,
-    NativeExtensionClassInstancePtr p_instance,
-    const NativeExtensionConstVariantPtr* p_args,
-    NativeExtensionInt p_argument_count,
-    NativeExtensionVariantPtr r_return,
-    NativeExtensionCallError* r_error
-);
+// on_add(target, property_or_callback, [callback]) -> int: as listen()
+GOBUEXT_METHOD(gobuext_colyseus_callbacks_on_add);
 
-// on_remove(target, property_or_callback, [callback]) -> int
-void gobuext_colyseus_callbacks_on_remove(
-    void* p_method_userdata,
-    NativeExtensionClassInstancePtr p_instance,
-    const NativeExtensionConstVariantPtr* p_args,
-    NativeExtensionInt p_argument_count,
-    NativeExtensionVariantPtr r_return,
-    NativeExtensionCallError* r_error
-);
+// on_remove(target, property_or_callback, [callback]) -> int: as listen()
+GOBUEXT_METHOD(gobuext_colyseus_callbacks_on_remove);
 
 // on_change(target, property_or_callback, [callback]) -> int
-void gobuext_colyseus_callbacks_on_change(
-    void* p_method_userdata,
-    NativeExtensionClassInstancePtr p_instance,
-    const NativeExtensionConstVariantPtr* p_args,
-    NativeExtensionInt p_argument_count,
-    NativeExtensionVariantPtr r_return,
-    NativeExtensionCallError* r_error
-);
+// - on_change(callback) - the root state changed
+// - on_change("property", callback) - a collection of the root state changed
+// - on_change(schema_dict, callback) - a nested schema changed
+// - on_change(schema_dict, "property", callback) - a collection of a nested schema changed
+GOBUEXT_METHOD(gobuext_colyseus_callbacks_on_change);
 
-// remove(handle) -> void
-void gobuext_colyseus_callbacks_remove(
-    void* p_method_userdata,
-    NativeExtensionClassInstancePtr p_instance,
-    const NativeExtensionConstVariantPtr* p_args,
-    NativeExtensionInt p_argument_count,
-    NativeExtensionVariantPtr r_return,
-    NativeExtensionCallError* r_error
-);
-
-// Internal: Initialize a callbacks wrapper with a room
-void gobuext_colyseus_callbacks_init_with_room(
-    ColyseusCallbacksWrapper* wrapper,
-    ColyseusRoomWrapper* room_wrapper
-);
-
-// Internal: Get the last created wrapper (for factory method)
-ColyseusCallbacksWrapper* gobuext_colyseus_callbacks_get_last_wrapper(void);
+// remove(handle)
+GOBUEXT_METHOD(gobuext_colyseus_callbacks_remove);
 
 #ifdef __cplusplus
 }
