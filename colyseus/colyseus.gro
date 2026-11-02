@@ -1,0 +1,1101 @@
+module Colyseus
+## Colyseus SDK for Gobu (0.18.0): the client of the plugin's native classes (_ColyseusClient,
+## _ColyseusRoom, _ColyseusCallbacks), on Windows and the web (Gobu's web templates without threads).
+##
+## Every wrapper is a `struct` with an `impl` block. Structs are values: keep them in `mut` variables and
+## call methods on those variables (a struct returned by a call and used inline is a temporary copy).
+##
+## Usage:
+##   mut client := Colyseus.Client.new("ws://localhost:2567")
+##   mut room := client.join_or_create("my_room")
+##   room.on_state_changed(fn() { print(room.get_state()) })
+##   mut callbacks := room.callbacks()
+##
+## - Signals live on the native room: `room.native.joined.connect(cb)`, or use the `room.on_joined(cb)`
+##   helpers.
+## - Read-only properties are methods: `room.is_connected()`, `input.epoch()`.
+## - Staged input fields: `input.set_field("move_x", 1)`.
+## - `Callbacks.of(room)` / `Predict.of(room)` take the native room; prefer `room.callbacks()` and
+##   `room.predict()`.
+## - The state is Dictionaries (`room.get_state()`), described by the server's reflection; a game may describe
+##   it itself with `Colyseus.field()` and `Colyseus.schema()` (`room.set_state_type()`).
+
+# =============================================================================
+# Schema type constants
+# =============================================================================
+
+## String type
+STRING :: "string"
+## Number type (64-bit float)
+NUMBER :: "number"
+## Boolean type
+BOOLEAN :: "boolean"
+## Signed 8-bit integer
+INT8 :: "int8"
+## Unsigned 8-bit integer
+UINT8 :: "uint8"
+## Signed 16-bit integer
+INT16 :: "int16"
+## Unsigned 16-bit integer
+UINT16 :: "uint16"
+## Signed 32-bit integer
+INT32 :: "int32"
+## Unsigned 32-bit integer
+UINT32 :: "uint32"
+## Signed 64-bit integer
+INT64 :: "int64"
+## Unsigned 64-bit integer
+UINT64 :: "uint64"
+## 32-bit float
+FLOAT32 :: "float32"
+## 64-bit float
+FLOAT64 :: "float64"
+## Map collection type (key-value pairs)
+MAP :: "map"
+## Array collection type (ordered list)
+ARRAY :: "array"
+## Reference to another schema
+REF :: "ref"
+
+## Predict smoothing modes (see [Predict]).
+LERP :: 0
+EXTRAPOLATE :: 1
+DAMPED :: 2
+RECKON :: 3
+RAW :: 4
+
+## Auth operations (the op of the native auth_request()); the order is the ABI.
+_AUTH_GET_USER_DATA :: 0
+_AUTH_REGISTER :: 1
+_AUTH_SIGN_IN :: 2
+_AUTH_SIGN_IN_ANONYMOUS :: 3
+_AUTH_SEND_PASSWORD_RESET :: 4
+
+# =============================================================================
+# Polling
+# =============================================================================
+
+## Internal: a native ColyseusClient instance kept alive for calling static poll()
+static mut _poll_instance: any = null
+## Internal: whether `poll()` is already wired to the scene tree's frame signal.
+static mut _poll_connected := false
+
+## Poll the native SDK for network events. Called automatically each frame
+## once a client exists. Only call manually for headless/test usage.
+static fn poll() void {
+	if _poll_instance != null {
+		_poll_instance.poll()
+	}
+}
+
+static fn _ensure_polling() void {
+	if _poll_connected {
+		return
+	}
+	mut tree := Engine.get_main_loop() as SceneTree
+	if tree == null {
+		return
+	}
+	mut on_frame := fn() { poll() }
+	tree.process_frame.connect(on_frame)
+	_poll_connected = true
+}
+
+## @deprecated: Use Colyseus.Client.new("ws://localhost:2567") instead.
+static fn create_client() Client {
+	push_warning("Colyseus.create_client() is deprecated. Use Colyseus.Client.new(endpoint) instead.")
+	return Client.new("")
+}
+
+## @deprecated: Use room.callbacks() instead.
+static fn callbacks(native_room: Object) Callbacks {
+	push_warning("Colyseus.callbacks(room) is deprecated. Use room.callbacks() instead.")
+	return Callbacks.of(native_room)
+}
+
+# =============================================================================
+# Schema definition helpers
+# =============================================================================
+##
+## Describe your state with plain data, e.g.:
+##
+##   mut player := Colyseus.schema([
+##       Colyseus.field("x", Colyseus.NUMBER),
+##       Colyseus.field("y", Colyseus.NUMBER),
+##   ])
+##   mut room_state := Colyseus.schema([
+##       Colyseus.field("players", Colyseus.MAP, player),
+##   ])
+##   room.set_state_type(room_state)
+
+## A single schema field: { name, type, child_type, key_type }.
+static fn field(field_name: String, field_type: String, child = null, key: String = "string") Dictionary {
+	return { "name": field_name, "type": field_type, "child_type": child, "key_type": key }
+}
+
+## A schema definition: { "fields": [field, ...] }.
+static fn schema(fields: Array) Dictionary {
+	return { "fields": fields }
+}
+
+## Check if a field definition holds a primitive type
+static fn field_is_primitive(field_def: Dictionary) bool {
+	return is_primitive_type(str(field_def.get("type", "")))
+}
+
+## Check if a field definition is a collection (MAP or ARRAY)
+static fn field_is_collection(field_def: Dictionary) bool {
+	return is_collection_type(str(field_def.get("type", "")))
+}
+
+## Check if a field definition is a reference to another schema
+static fn field_is_ref(field_def: Dictionary) bool {
+	return str(field_def.get("type", "")) == REF
+}
+
+## Check if a type string represents a primitive type
+static fn is_primitive_type(type_str: String) bool {
+	return type_str in [STRING, NUMBER, BOOLEAN, INT8, UINT8, INT16, UINT16, INT32, UINT32, INT64, UINT64, FLOAT32, FLOAT64]
+}
+
+## Check if a type string represents a collection type
+static fn is_collection_type(type_str: String) bool {
+	return type_str in [MAP, ARRAY]
+}
+
+## Get the default value for a primitive type
+static fn get_default_value(type_str: String) {
+	match type_str {
+		STRING: { return "" }
+		NUMBER, FLOAT32, FLOAT64: { return 0.0 }
+		BOOLEAN: { return false }
+		INT8, UINT8, INT16, UINT16, INT32, UINT32, INT64, UINT64: { return 0 }
+		_: { return null }
+	}
+}
+
+# =============================================================================
+# Reply routing (HTTP + Auth)
+# =============================================================================
+##
+## Callback-based requests answer through the native `_http_response` /
+## `_http_error` signals. Both HTTP and Auth share ONE reply table per client:
+## both dispatch through the same native queue and draw their request ids from
+## the same counter, so a second router would receive (and have to ignore) the
+## other's replies. The table is a Dictionary (request_id -> Callable) shared
+## by reference between the Client, HTTP and Auth structs.
+
+## Remembers `callback` for `request_id`, and hands the id straight back so a
+## dispatch reads as one line.
+static fn _replies_track(replies: Dictionary, request_id: int, callback: Callable) int {
+	if request_id != 0 and callback.is_valid() {
+		replies[request_id] = callback
+	}
+	return request_id
+}
+
+static fn _replies_take(replies: Dictionary, request_id: int) Callable {
+	if not replies.has(request_id) {
+		return Callable()
+	}
+	mut callback: Callable = replies[request_id]
+	replies.erase(request_id)
+	return callback
+}
+
+static fn _on_http_response(replies: Dictionary, request_id: int, _status_code: int, body: String) void {
+	mut callback := _replies_take(replies, request_id)
+	if not callback.is_valid() {
+		return
+	}
+	mut json := JSON.new()
+	mut data: any = body
+	if json.parse(body) == OK {
+		data = json.data
+	}
+	callback.call(null, data)
+}
+
+static fn _on_http_error(replies: Dictionary, request_id: int, code: int, message: String) void {
+	mut callback := _replies_take(replies, request_id)
+	if callback.is_valid() {
+		callback.call({ "code": code, "message": message }, null)
+	}
+}
+
+## Dictionaries and Arrays are encoded; anything else goes as its string form,
+## so a caller can pass a pre-built JSON body verbatim.
+static fn _json_body(body) String {
+	if body is Dictionary or body is Array {
+		return JSON.stringify(body)
+	}
+	return str(body)
+}
+
+# =============================================================================
+# Callbacks
+# =============================================================================
+
+## Wraps the native ColyseusCallbacks.
+Callbacks :: struct {
+	native : Object = null
+}
+
+impl Callbacks {
+	## Build the callbacks helper for a native room (prefer `room.callbacks()`).
+	fn of(native_room: Object) Callbacks {
+		mut result := Callbacks{}
+		mut class_name_str := &"_ColyseusCallbacks"
+		if ClassDB.class_exists(class_name_str) {
+			mut instance: Object = ClassDB.instantiate(class_name_str)
+			mut native_cb: Object = null
+			if instance != null and instance.has_method(&"_init_with_room") {
+				instance._init_with_room(native_room)
+				native_cb = instance
+			} elif instance != null and instance.has_method(&"get") {
+				native_cb = instance.call(&"get", native_room)
+			}
+			if native_cb != null {
+				result.native = native_cb
+				return result
+			}
+		}
+		push_error("Colyseus: ColyseusCallbacks not available. Make sure the native extension is properly loaded.")
+		return result
+	}
+
+	fn is_valid(self) bool {
+		return self.native != null
+	}
+
+	fn listen(self, target, property_or_callback, callback = null) int {
+		if callback == null {
+			return self.native.listen(target, property_or_callback)
+		}
+		return self.native.listen(target, property_or_callback, callback)
+	}
+
+	fn on_add(self, target, property_or_callback, callback = null) int {
+		if callback == null {
+			return self.native.on_add(target, property_or_callback)
+		}
+		return self.native.on_add(target, property_or_callback, callback)
+	}
+
+	fn on_remove(self, target, property_or_callback, callback = null) int {
+		if callback == null {
+			return self.native.on_remove(target, property_or_callback)
+		}
+		return self.native.on_remove(target, property_or_callback, callback)
+	}
+
+	fn on_change(self, target, property_or_callback = null, callback = null) int {
+		if property_or_callback == null {
+			return self.native.on_change(target)
+		}
+		if callback == null {
+			return self.native.on_change(target, property_or_callback)
+		}
+		return self.native.on_change(target, property_or_callback, callback)
+	}
+
+	fn remove(self, handle: int) void {
+		self.native.remove(handle)
+	}
+}
+
+# =============================================================================
+# Input — the per-room input handle (predict layer, phase 1)
+# =============================================================================
+
+## Staged input fields. Set them with `input.set_field("move_x", 1)`; each
+## assignment lands in the C-side instance the encoder reads at `send()`,
+## which delta-encodes and transmits one input and returns its 1-based seq
+## (0 = nothing sent). See input_handle.h for the wire contract.
+InputHandle :: struct {
+	native : Object = null
+}
+
+impl InputHandle {
+	fn is_valid(self) bool {
+		return self.native != null
+	}
+
+	## Stage one input field (numbers only; bools are sent as 0/1).
+	fn set_field(self, field_name: String, value) void {
+		self.native.set_field(field_name, float(value))
+	}
+
+	## Read back a staged input field.
+	fn get_field(self, field_name: String) float {
+		return self.native.get_field(field_name)
+	}
+
+	fn send(self) int {
+		return self.native.send()
+	}
+
+	## Reset encoder + round-trip state (the SDK calls this on reconnect).
+	fn reset(self) void {
+		self.native.reset()
+	}
+
+	fn pending_count(self) int {
+		return self.native.pending_count()
+	}
+
+	fn last_processed(self) int {
+		return self.native.last_processed()
+	}
+
+	fn sent_count(self) int {
+		return self.native.sent_count()
+	}
+
+	fn epoch(self) int {
+		return self.native.epoch()
+	}
+
+	fn tick_rate(self) int {
+		return self.native.tick_rate()
+	}
+
+	fn patch_rate(self) int {
+		return self.native.patch_rate()
+	}
+
+	## Lag-comp render delay (ms) — the predict layer binds this automatically
+	## from its lerp delay; set by hand only when interpolating outside it.
+	fn get_render_delay(self) float {
+		return self.native.render_delay()
+	}
+
+	fn set_render_delay(self, value: float) void {
+		self.native.set_render_delay(value)
+	}
+
+	## Stamp lag-comp rewind times ONLY on inputs whose named field is truthy
+	## (e.g. "fire") — movement inputs skip the extra wire bytes. Equivalent to
+	## the JS SDK's allowRewind option.
+	fn set_rewind_field(self, field_name: String) void {
+		self.native.set_rewind_field(field_name)
+	}
+}
+
+# =============================================================================
+# Clock
+# =============================================================================
+
+## Room clock readouts — all milliseconds on the axes the SDK maintains.
+Clock :: struct {
+	native : Object = null
+}
+
+impl Clock {
+	fn now(self) float { return self.native.clock_now() }
+	fn server_now(self) float { return self.native.clock_server_now() }
+	fn render_now(self) float { return self.native.clock_render_now() }
+	fn rtt(self) float { return self.native.clock_rtt() }
+	fn smoothed_rtt(self) float { return self.native.clock_smoothed_rtt() }
+	fn jitter(self) float { return self.native.clock_jitter() }
+	fn last_server_time(self) float { return self.native.clock_last_server_time() }
+	fn patch_interval(self) float { return self.native.clock_patch_interval() }
+}
+
+# =============================================================================
+# Room
+# =============================================================================
+
+## Wraps the native ColyseusRoom. Signals are exposed on `room.native`
+## (`joined`, `state_changed`, `message_received(type, data)`,
+## `error(code, message)`, `left(code, reason)`, `dropped(code, reason)`,
+## `reconnected`), or through the `on_*` helpers below.
+Room :: struct {
+	native : Object = null
+}
+
+impl Room {
+	fn new(native_room: Object) Room {
+		return Room{ .native = native_room }
+	}
+
+	fn is_valid(self) bool {
+		return self.native != null
+	}
+
+	# --- signal helpers ------------------------------------------------------
+
+	fn on_joined(self, callback: Callable) void {
+		self.native.joined.connect(callback)
+	}
+
+	fn on_state_changed(self, callback: Callable) void {
+		self.native.state_changed.connect(callback)
+	}
+
+	## `callback(type, data)`
+	fn on_message(self, callback: Callable) void {
+		self.native.message_received.connect(callback)
+	}
+
+	## `callback(code: int, message: String)`
+	fn on_error(self, callback: Callable) void {
+		self.native.error.connect(callback)
+	}
+
+	## `callback(code: int, reason: String)`
+	fn on_left(self, callback: Callable) void {
+		self.native.left.connect(callback)
+	}
+
+	## `callback(code: int, reason: String)`
+	fn on_dropped(self, callback: Callable) void {
+		self.native.dropped.connect(callback)
+	}
+
+	fn on_reconnected(self, callback: Callable) void {
+		self.native.reconnected.connect(callback)
+	}
+
+	# --- messaging -----------------------------------------------------------
+
+	fn send_message(self, type, data = null) void {
+		# Native method is registered with two required args (type, data) and
+		# decoded via call_vararg; always pass both, using a null variant for
+		# empty payloads.
+		self.native.send_message(type, data)
+	}
+
+	fn leave(self) void {
+		self.native.leave()
+	}
+
+	fn get_id(self) String {
+		return self.native.get_id()
+	}
+
+	fn get_session_id(self) String {
+		return self.native.get_session_id()
+	}
+
+	## Token for [method Client.reconnect]. Persist it to re-take this seat
+	## after the process is killed (the server must `allowReconnection()`).
+	fn get_reconnection_token(self) String {
+		return self.native.get_reconnection_token()
+	}
+
+	fn get_name(self) String {
+		return self.native.get_name()
+	}
+
+	fn is_connected(self) bool {
+		return self.native.call(&"is_connected")
+	}
+
+	fn is_reconnecting(self) bool {
+		return self.native.is_reconnecting()
+	}
+
+	## Tune automatic reconnection. Pass any subset of the following keys:
+	##   enabled: bool, max_retries: int, min_delay_ms: int, max_delay_ms: int,
+	##   min_uptime_ms: int, delay_ms: int, max_enqueued_messages: int.
+	## Omitted keys keep their current value. Defaults match the @colyseus/sdk
+	## TypeScript SDK.
+	fn set_reconnection_options(self, options: Dictionary) void {
+		self.native.set_reconnection_options(options)
+	}
+
+	fn get_state(self) {
+		return self.native.get_state()
+	}
+
+	fn set_state_type(self, state_type) void {
+		self.native.set_state_type(state_type)
+	}
+
+	# --- helpers over the native room ----------------------------------------
+
+	## Callbacks helper bound to this room.
+	fn callbacks(self) Callbacks {
+		return Callbacks.of(self.native)
+	}
+
+	## A FRESH Predict over this room (several can coexist).
+	fn predict(self) Predict {
+		return Predict.of(self.native)
+	}
+
+	## The per-room input handle: stage fields with `set_field()`, then `send()`.
+	## The input schema comes from the server's handshake (INPUT_REFLECTION) —
+	## the client declares nothing. Invalid (`is_valid() == false`) until the
+	## room has joined and the server declared defineInput().
+	fn input(self) InputHandle {
+		return InputHandle{ .native = self.native.input() }
+	}
+
+	## Server-time + RTT estimator readouts (the SDK's room clock).
+	fn clock(self) Clock {
+		return Clock{ .native = self.native }
+	}
+
+	## Latency injector at the transport seam. Both numbers are ROUND TRIPS,
+	## split evenly across the two directions, so `delay_ms` is what
+	## clock.smoothed_rtt() converges to — the same meaning the JS SDK's
+	## __net() has. Never reorders; the handshake is never delayed (call after
+	## join). Call net_pump() once per frame, right after Colyseus.poll(), or
+	## delayed packets never deliver.
+	fn set_latency(self, delay_ms: float, jitter_ms: float = 0.0) void {
+		self.native.set_latency(delay_ms, jitter_ms)
+	}
+
+	fn net_pump(self) void {
+		self.native.net_pump()
+	}
+
+	fn net_in_flight(self) int {
+		return self.native.net_in_flight()
+	}
+
+	## Kill the socket UNCLEANLY (close code 4010): the SDK sees a drop, not a
+	## leave, and auto-reconnects — `dropped` then `reconnected` fire, the input
+	## handle resets (epoch bump -> reconcilers self-reset), and state re-decodes
+	## (rebind instances in your reconnect handler). The room must be up past
+	## the reconnection min-uptime or the SDK gives up instead. Native only —
+	## web has no auto-reconnect. Re-apply set_latency after reconnect: the
+	## fresh transport is unwrapped.
+	fn drop(self) void {
+		self.native.drop_transport()
+	}
+}
+
+# =============================================================================
+# Predict — passive smoothing of the server stream (predict layer, phase 2)
+# =============================================================================
+
+# Forward declarations: these structs are built by `Predict` methods below.
+
+## Predicted-spawn store — born from Predict.spawns().
+Spawns :: struct {
+	native : Object = null
+}
+
+## Optimistic events — born from Predict.define_event().
+EventChannel :: struct {
+	native : Object = null
+}
+
+## The rollback controller for the entity you control — born from
+## Predict.reconciler(). See that method for the step contract.
+Reconciler :: struct {
+	native : Object = null
+}
+
+## Per-field smoothing options. Build one with [method PredictOptions.from]
+## from a bare mode constant or a Dictionary with any of
+## mode / delay / smooth_ms / max_extrapolate / snap / angle (0 = default).
+PredictOptions :: struct {
+	mode : int = 0
+	delay : float = 0.0
+	smooth_ms : float = 0.0
+	max_extrapolate : float = 0.0
+	snap : float = 0.0
+	angle : bool = false
+}
+
+impl PredictOptions {
+	fn from(entry) PredictOptions {
+		mut o := PredictOptions{}
+		if entry is int {
+			o.mode = entry
+		} elif entry is Dictionary {
+			o.mode = int(entry.get("mode", LERP))
+			o.delay = float(entry.get("delay", 0.0))
+			o.smooth_ms = float(entry.get("smooth_ms", 0.0))
+			o.max_extrapolate = float(entry.get("max_extrapolate", 0.0))
+			o.snap = float(entry.get("snap", 0.0))
+			o.angle = bool(entry.get("angle", false))
+		}
+		return o
+	}
+}
+
+## Smoothed reads over decoded entities you DON'T control. One read idiom:
+## `predict.value(instance, "x")` — lerp / damped / extrapolate / raw per
+## attached field, raw fallback when untracked, NAN for unknown fields.
+##
+##   mut predict := room.predict()
+##   predict.attach_all("players", {
+##       "x": Colyseus.DAMPED,
+##       "y": { "mode": Colyseus.LERP, "delay": 100 },
+##   }, room.get_session_id())
+##   predict.tick(now_ms)                # once per frame; returns input steps due
+##   mut x := predict.value(player, "x")
+Predict :: struct {
+	native : Object = null
+	room_native : Object = null
+}
+
+impl Predict {
+	## A FRESH Predict over the native room (Predictor.ts's Predict.For) —
+	## several can coexist, each with its own smoothing curves.
+	fn of(native_room: Object) Predict {
+		return Predict{ .native = native_room.predict(), .room_native = native_room }
+	}
+
+	fn is_valid(self) bool {
+		return self.native != null
+	}
+
+	## Per-field config: a bare mode constant, or a Dictionary with any of
+	## mode / delay / smooth_ms / max_extrapolate / snap / angle (0 = default).
+	fn attach(self, instance, config: Dictionary) void {
+		for field_name in config {
+			mut o := PredictOptions.from(config[field_name])
+			self.native.attach_field(instance, field_name, o.mode, o.delay, o.smooth_ms, o.max_extrapolate, o.snap, o.angle)
+		}
+	}
+
+	## Track EVERY entry of a state collection — present now or arriving later —
+	## and stop as entries are removed. `except_key` skips one map key (yours).
+	fn attach_all(self, collection: String, config: Dictionary, except_key: String = "") void {
+		for field_name in config {
+			mut o := PredictOptions.from(config[field_name])
+			self.native.attach_all_field(collection, field_name, o.mode, o.delay, o.smooth_ms, o.max_extrapolate, o.snap, o.angle, except_key)
+		}
+	}
+
+	fn detach(self, instance) void {
+		self.native.detach(instance)
+	}
+
+	## Dead-reckon `fields` of one instance through a step SHARED with the
+	## server: `step.call(state, dt, elapsed_ms)` forwards a scratch copy from
+	## the latest snapshot to the present. Opts: smooth_ms / substep_ms / snap.
+	fn attach_reckon(self, instance, fields: Array, step: Callable, opts: Dictionary = {}) void {
+		self.native.attach_reckon(instance, fields, step,
+			float(opts.get("smooth_ms", 0.0)),
+			float(opts.get("substep_ms", 0.0)),
+			float(opts.get("snap", 0.0)))
+	}
+
+	## As attach_all, but dead-reckons every entry through the shared step.
+	fn attach_all_reckon(self, collection: String, fields: Array, step: Callable, opts: Dictionary = {}) void {
+		self.native.attach_all_reckon(collection, fields, step,
+			float(opts.get("smooth_ms", 0.0)),
+			float(opts.get("substep_ms", 0.0)),
+			float(opts.get("snap", 0.0)))
+	}
+
+	## Advance one render frame. RETURNS the fixed input steps due — send
+	## exactly one input per returned step to stay on the server's cadence.
+	##
+	## Leave `now_ms` off to read the SDK clock, which is what the JS reference
+	## does with its performance.now() default. Clock readings are never
+	## negative, so the sentinel cannot collide with a real timestamp.
+	fn tick(self, now_ms: float = -1.0) int {
+		mut t := now_ms
+		if t < 0.0 {
+			t = self.room_native.clock_now()
+		}
+		return self.native.tick(t)
+	}
+
+	fn value(self, instance, field_name: String) float {
+		return self.native.value(instance, field_name)
+	}
+
+	## RAW reckoned value at a server-time instant — for lag-comp hit tests.
+	fn value_at(self, instance, field_name: String, time_ms: float) float {
+		return self.native.value_at(instance, field_name, time_ms)
+	}
+
+	## Server-reconciled rollback for the entity YOU control. The step is the
+	## same deterministic function the server runs — it receives
+	## (ctx, state, cmd) where `state` is the predicted mirror (mutate it:
+	## `state.x += state.vx * ctx.dt`) and `cmd` the input being applied.
+	## Options: input (InputHandle), fields (Array[String]), smooth_ms
+	## (-1 = default), snap (0 = off), step (Callable).
+	fn reconciler(self, instance, opts: Dictionary) Reconciler {
+		mut native: Object = self.native.reconciler(
+			instance,
+			_input_native(opts.get("input")),
+			opts.get("fields", []),
+			float(opts.get("smooth_ms", -1.0)),
+			float(opts.get("snap", 0.0)),
+			opts.get("step"))
+		return Reconciler{ .native = native }
+	}
+
+	## The COMPOSITE face: one rollback over a world of named parts, all
+	## predicted through your inputs in the server's step order. `world` maps
+	## part names to DECODED instances; the step receives the mirrors as
+	## `w.<name>` (`w.paddle.x += ...`, `w.puck.vx = ...`). Bound poses read
+	## back via predict.value(instance, field); reconciler.value("part.field")
+	## is the low-level escape hatch.
+	fn sim(self, opts: Dictionary) Reconciler {
+		mut native: Object = self.native.sim(
+			opts.get("world", {}),
+			_input_native(opts.get("input")),
+			float(opts.get("smooth_ms", -1.0)),
+			float(opts.get("snap", 0.0)),
+			opts.get("step"))
+		return Reconciler{ .native = native }
+	}
+
+	## A typed optimistic-event channel: predict from inside a reconciler step
+	## (`ctx.predict(channel, "goal")` — live-only, replay-safe) or from UI
+	## (`channel.predict("goal")`); confirm on the authoritative signal;
+	## unconfirmed sim-born predictions auto-reject after `grace_ticks`.
+	## Callbacks receive the event key.
+	fn define_event(self, opts: Dictionary = {}) EventChannel {
+		mut native: Object = self.native.define_event(
+			opts.get("on_predict"),
+			opts.get("on_confirm"),
+			opts.get("on_reject"),
+			int(opts.get("grace_ticks", 0)),
+			float(opts.get("ttl_ms", 0.0)),
+			float(opts.get("cooldown_ms", 0.0)))
+		return EventChannel{ .native = native }
+	}
+
+	## Predicted spawns for a state collection: optimistic LOCALS (plain
+	## Dictionaries) correlate with the server's entities on arrival — one
+	## logical entry, one stable id, no visual seam.
+	##   opts: owned (Callable(server)->bool), spawn_time (Callable(server)->
+	##   born_ms — enables the measured input lead), step (Callable(local, dt)),
+	##   ttl_ms (0 = max(2·rtt, 600)),
+	##   fields (Array[String]) + reckon_step (Callable(state, dt, elapsed_ms))
+	##   — dead-reckon CONFIRMED entities by snapshot age + measured lead, so
+	##   the handoff doesn't snap back by lead x velocity.
+	fn spawns(self, collection: String, opts: Dictionary = {}) Spawns {
+		mut native: Object = self.native.spawns(
+			collection,
+			opts.get("owned"),
+			opts.get("spawn_time"),
+			opts.get("step"),
+			float(opts.get("ttl_ms", 0.0)),
+			opts.get("fields", []),
+			opts.get("reckon_step"))
+		return Spawns{ .native = native }
+	}
+}
+
+## The `input` option of [method Predict.reconciler] / [method Predict.sim]
+## accepts the native input handle or `room.input().native`.
+static fn _input_native(input) Object {
+	if input == null {
+		return null
+	}
+	return input
+}
+
+impl Spawns {
+	fn is_valid(self) bool {
+		return self.native != null
+	}
+
+	## Record an optimistic local (a Dictionary); returns its stable id.
+	fn spawn(self, local: Dictionary) int {
+		return self.native.spawn(local)
+	}
+
+	## Render value across the handoff: the local's field while pending, the
+	## authoritative instance's after correlation.
+	fn value(self, id: int, field_name: String) float {
+		return self.native.value(id, field_name)
+	}
+
+	## A string field off the CONFIRMED server instance ("" while pending).
+	fn server_string(self, id: int, field_name: String) String {
+		return self.native.server_string(id, field_name)
+	}
+
+	## Entries in insertion order: [{id, confirmed, lead_ms, has_local}].
+	fn entries(self) Array {
+		return self.native.entries()
+	}
+
+	fn size(self) int {
+		return self.native.size()
+	}
+
+	fn clear(self) void {
+		self.native.clear()
+	}
+}
+
+impl EventChannel {
+	fn is_valid(self) bool {
+		return self.native != null
+	}
+
+	## UI-born prediction (wall-clock TTL settlement). False when dropped.
+	fn predict(self, key: String) bool {
+		return self.native.predict_ui(key)
+	}
+
+	## The server agreed: settle `key` ("" = every pending). Returns the count.
+	fn confirm(self, key: String = "") int {
+		return self.native.confirm(key)
+	}
+
+	## The server overruled ("" = every pending).
+	fn reject(self, key: String = "") int {
+		return self.native.reject(key)
+	}
+
+	fn pending_count(self) int {
+		return self.native.pending_count()
+	}
+
+	fn clear(self) void {
+		self.native.clear()
+	}
+}
+
+impl Reconciler {
+	fn is_valid(self) bool {
+		return self.native != null
+	}
+
+	## Rendered value: predicted state + the decaying correction offset.
+	fn value(self, field_name: String) float {
+		return self.native.value(field_name)
+	}
+
+	## The TRUE predicted state (the mirror view) — read for game logic.
+	fn state(self) {
+		return self.native.state()
+	}
+
+	## The composite face's part views (`world.paddle`); null on the flat face.
+	fn world(self) {
+		return self.native.world()
+	}
+
+	fn pending_count(self) int {
+		return self.native.pending_count()
+	}
+
+	fn reconcile_seq(self) int {
+		return self.native.reconcile_seq()
+	}
+
+	fn last_correction_mag(self) float {
+		return self.native.last_correction_mag()
+	}
+
+	fn drift_ema(self) float {
+		return self.native.drift_ema()
+	}
+
+	## Re-seed from the authoritative instance; drops offsets and the in-flight
+	## window. Call from on_reconnect.
+	fn reset(self) void {
+		self.native.reset()
+	}
+}
+
+# =============================================================================
+# HTTP — callback-based HTTP requests
+# =============================================================================
+
+## HTTP client for making requests to the Colyseus server.
+## Note: "get" is renamed to "get_request" because Object.get() is reserved.
+## Usage:
+##   client.http.get_request("/test", fn(err, data) { print(data) })
+##   client.http.post("/save", {"key": "val"}, fn(err, data) { print(data) })
+HTTP :: struct {
+	native : Object = null
+	replies : Dictionary = {}
+}
+
+impl HTTP {
+	## Set the auth token (sent as Bearer header on all requests)
+	fn set_auth_token(self, value: String) void {
+		if self.native != null {
+			self.native.auth_set_token(value)
+		}
+	}
+
+	fn get_auth_token(self) String {
+		if self.native == null {
+			return ""
+		}
+		return self.native.auth_get_token()
+	}
+
+	## GET request (named get_request to avoid conflict with Object.get)
+	fn get_request(self, path: String, callback: Callable) int {
+		return _replies_track(self.replies, self.native.http_get(path), callback)
+	}
+
+	## POST request (body auto-converted to JSON if Dictionary/Array)
+	fn post(self, path: String, body, callback: Callable) int {
+		return _replies_track(self.replies, self.native.http_post(path, _json_body(body)), callback)
+	}
+
+	## PUT request
+	fn put(self, path: String, body, callback: Callable) int {
+		return _replies_track(self.replies, self.native.http_put(path, _json_body(body)), callback)
+	}
+
+	## DELETE request
+	fn delete(self, path: String, callback: Callable) int {
+		return _replies_track(self.replies, self.native.http_delete(path), callback)
+	}
+
+	## PATCH request
+	fn patch(self, path: String, body, callback: Callable) int {
+		return _replies_track(self.replies, self.native.http_patch(path, _json_body(body)), callback)
+	}
+}
+
+# =============================================================================
+# Auth — token management
+# =============================================================================
+
+## Auth module for managing authentication tokens.
+## Usage:
+##   client.auth.set_token("my-jwt-token")
+##   mut token := client.auth.get_token()
+Auth :: struct {
+	native : Object = null
+	replies : Dictionary = {}
+}
+
+impl Auth {
+	## Set the auth token (sent as Bearer header on every later request)
+	fn set_token(self, token: String) void {
+		self.native.auth_set_token(token)
+	}
+
+	## Get the current auth token, or "" when signed out
+	fn get_token(self) String {
+		return self.native.auth_get_token()
+	}
+
+	## Sign in without credentials. The token still identifies the player, so
+	## keep it if you want them back on the same account next launch.
+	fn sign_in_anonymously(self, callback: Callable, options: Dictionary = {}) int {
+		return self.request(_AUTH_SIGN_IN_ANONYMOUS, "", "", callback, options)
+	}
+
+	## Create an account. `options` is merged into the request body.
+	fn register_with_email_and_password(self, email: String, password: String, callback: Callable, options: Dictionary = {}) int {
+		return self.request(_AUTH_REGISTER, email, password, callback, options)
+	}
+
+	fn sign_in_with_email_and_password(self, email: String, password: String, callback: Callable) int {
+		return self.request(_AUTH_SIGN_IN, email, password, callback)
+	}
+
+	## The user record behind the current token. Fails when there is none.
+	fn get_user_data(self, callback: Callable) int {
+		return self.request(_AUTH_GET_USER_DATA, "", "", callback)
+	}
+
+	fn send_password_reset_email(self, email: String, callback: Callable) int {
+		return self.request(_AUTH_SEND_PASSWORD_RESET, email, "", callback)
+	}
+
+	## Drop the token locally and clear it from secure storage. No request.
+	fn sign_out(self) void {
+		self.native.auth_signout()
+	}
+
+	## Every call answers the same way an HTTP one does — `callback(err, data)`,
+	## where a successful `data` is `{ "user": {...}, "token": "..." }`, the
+	## shape the server replied with.
+	fn request(self, op: int, email: String, password: String, callback: Callable, options: Dictionary = {}) int {
+		mut options_json := ""
+		if not options.is_empty() {
+			options_json = JSON.stringify(options)
+		}
+		return _replies_track(self.replies, self.native.auth_request(op, email, password, options_json), callback)
+	}
+}
+
+# =============================================================================
+# Client — exposes .http and .auth sub-objects
+# =============================================================================
+
+## Wraps the native ColyseusClient to provide .http and .auth accessors
+## matching the TypeScript SDK structure.
+Client :: struct {
+	native : Object = null
+	http : HTTP
+	auth : Auth
+}
+
+impl Client {
+	## Create a client. `endpoint` is e.g. "ws://localhost:2567".
+	fn new(endpoint: String = "") Client {
+		mut client := Client{}
+		mut class_name_str := &"_ColyseusClient"
+		if ClassDB.class_exists(class_name_str) {
+			client.native = ClassDB.instantiate(class_name_str)
+		}
+		if client.native == null {
+			push_error("Colyseus: ColyseusClient not available. Make sure the native extension is properly loaded.")
+			return client
+		}
+
+		# HTTP and Auth share one reply table (request_id -> Callable).
+		mut replies := {}
+		mut on_response := fn(request_id: int, status_code: int, body: String) { _on_http_response(replies, request_id, status_code, body) }
+		mut on_error := fn(request_id: int, code: int, message: String) { _on_http_error(replies, request_id, code, message) }
+		client.native._http_response.connect(on_response)
+		client.native._http_error.connect(on_error)
+		client.http = HTTP{ .native = client.native, .replies = replies }
+		client.auth = Auth{ .native = client.native, .replies = replies }
+
+		if endpoint != "" {
+			client.native.set_endpoint(endpoint)
+		}
+		if _poll_instance == null {
+			_poll_instance = client.native
+		}
+		_ensure_polling()
+		return client
+	}
+
+	fn is_valid(self) bool {
+		return self.native != null
+	}
+
+	## Set the server endpoint (e.g., "ws://localhost:2567")
+	fn set_endpoint(self, endpoint: String) void {
+		self.native.set_endpoint(endpoint)
+	}
+
+	## Get the server endpoint
+	fn get_endpoint(self) String {
+		return self.native.get_endpoint()
+	}
+
+	## Join or create a room. Check `room.is_valid()`.
+	fn join_or_create(self, room_name: String, options: Dictionary = {}) Room {
+		return Room.new(self.native.join_or_create(room_name, JSON.stringify(options)))
+	}
+
+	## Create a new room
+	fn create(self, room_name: String, options: Dictionary = {}) Room {
+		return Room.new(self.native.create(room_name, JSON.stringify(options)))
+	}
+
+	## Join an existing room by name
+	fn join(self, room_name: String, options: Dictionary = {}) Room {
+		return Room.new(self.native.join(room_name, JSON.stringify(options)))
+	}
+
+	## Join a room by its ID
+	fn join_by_id(self, room_id: String, options: Dictionary = {}) Room {
+		return Room.new(self.native.join_by_id(room_id, JSON.stringify(options)))
+	}
+
+	## Re-take a seat using the token from [method Room.get_reconnection_token]
+	fn reconnect(self, reconnection_token: String) Room {
+		return Room.new(self.native.reconnect(reconnection_token))
+	}
+}

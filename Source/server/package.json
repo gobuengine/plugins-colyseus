@@ -1,0 +1,25 @@
+{
+  "private": true,
+  "name": "gobu-colyseus-server",
+  "version": "1.0.0",
+  "description": "A Colyseus server for Gobu's online games: the GobuRelayRoom",
+  "main": "build/index.js",
+  "engines": {
+    "node": ">= 20.9.0"
+  },
+  "scripts": {
+    "start": "tsx watch src/index.ts",
+    "build": "npm run clean && tsc",
+    "clean": "rimraf build"
+  },
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "rimraf": "^5.0.0",
+    "tsx": "^4.10.2",
+    "typescript": "^5.0.4"
+  },
+  "dependencies": {
+    "@colyseus/tools": "^0.17.0",
+    "colyseus": "^0.17.0"
+  }
+}

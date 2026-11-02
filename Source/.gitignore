@@ -1,0 +1,8 @@
+# Zig's caches and outputs
+.zig-cache/
+zig-out/
+# The local link to the Emscripten SDK (web builds): see README.md
+gobu/emsdk
+# The server's packages and build
+server/node_modules/
+server/build/

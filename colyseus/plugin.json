@@ -1,0 +1,16 @@
+{
+	"id": "colyseus",
+	"name": "Colyseus",
+	"version": "0.18.0",
+	"description": "Colyseus multiplayer client: matchmaking, rooms, state sync, messages and auth; the \"colyseus\" provider for Gobu Online.",
+	"author": "Endel Dreyer",
+	"category": "Network",
+	"api_version": 1,
+	"entry": "gobu_plugin_init",
+	"libraries": {
+		"windows.x86_64.debug": "bin/colyseus_gobu.windows.x86_64.debug.dll",
+		"windows.x86_64": "bin/colyseus_gobu.windows.x86_64.release.dll",
+		"web.wasm32.debug": "bin/libcolyseus_gobu.web.wasm32.debug.wasm",
+		"web.wasm32": "bin/libcolyseus_gobu.web.wasm32.release.wasm"
+	}
+}

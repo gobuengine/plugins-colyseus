@@ -1,0 +1,16 @@
+.{
+    .name = .gobu,
+    .version = "0.17.0",
+    .dependencies = .{
+        .zig_msgpack = .{
+            .url = "git+https://github.com/zigcc/zig-msgpack?ref=main#47c15d217efebd17a585dd04125f9b6b6f659d5a",
+            .hash = "zig_msgpack-0.0.14-evvueGolBQBs_m726tBf4ISJQqC926AM96EtxZy9LUaI",
+        },
+        .emsdk = .{
+            .path = "emsdk",
+            .lazy = true,
+        },
+    },
+    .paths = .{""},
+    .fingerprint = 0xb39a102d575fc4a2,
+}
