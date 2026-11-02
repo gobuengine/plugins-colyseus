@@ -5,6 +5,12 @@ the repository's history.
 
 ## Gobu
 
+### The room sends players away
+- The `colyseus` provider has `kick`: when the host sends a player away (`Online.kick()`, or a login it turned
+  away), `GobuRelayRoom` closes that game's connection (code 4003), taking the request (`"k"`) from the host
+  only. Before, the player's game left by itself, and one that didn't (a modified game) stayed in the room.
+  A server of your own needs this `GobuRelayRoom`: an older one ignores the request.
+
 ### Straight on gobu_plugin.h
 - The binding used NativeExtension, Gobu's former extension API, through a layer that turned its calls into
   `gobu_plugin.h` ones (`gobu_compat.c`, with `nativeextension_interface.h`). Now it calls `gobu_plugin.h`

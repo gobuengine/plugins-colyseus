@@ -308,6 +308,17 @@ static void provider_send(void *p_connection, int32_t p_to, const uint8_t *p_dat
 	free(message);
 }
 
+/* The server sends a player away: the room closes that game's connection (it takes "k" from the host only). */
+static void provider_kick(void *p_connection, int32_t p_peer) {
+	Connection *connection = (Connection *)p_connection;
+	if (!connection->room || p_peer < 2) {
+		return;
+	}
+	uint8_t message[4];
+	write_id(message, p_peer);
+	colyseus_room_send_bytes(connection->room, "k", message, 4);
+}
+
 /* The client's own work on the web (its HTTP and WebSocket answers wait to be polled); natively nothing. */
 extern void colyseus_http_poll(void);
 extern void colyseus_ws_poll(void);
@@ -399,6 +410,7 @@ bool colyseus_register_online_provider(const GobuPluginApi *p_api, GobuPluginHan
 	info.flags = GOBU_ONLINE_CAN_MATCH;
 	info.match = provider_match;
 	info.send = provider_send;
+	info.kick = provider_kick;
 	info.poll = provider_poll;
 	info.close = provider_close;
 	return p_api->register_online_provider(p_plugin, &info);

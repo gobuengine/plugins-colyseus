@@ -13,8 +13,13 @@ import { Room, Client } from "@colyseus/core";
  * - "j" / "l" to the host: [the peer that joined / left].
  * - "h" from a game (empty): asks for its "w" again.
  * - "m" to every game, when the host left: [the previous id of the new host].
+ * - "k" from the host: [a peer]: the room closes that game's connection (Online.kick(), a login it turned away),
+ *   so a game that does not leave by itself goes too.
  */
 export class GobuRelayRoom extends Room {
+  // The close code of a game the host sent away.
+  static readonly KICKED = 4003;
+
   private ids = new Map<string, number>();
   private games = new Map<number, Client>();
   private nextId = 2;
@@ -30,6 +35,17 @@ export class GobuRelayRoom extends Room {
       const id = this.ids.get(client.sessionId);
       if (id !== undefined) {
         client.sendBytes("w", GobuRelayRoom.withId(id));
+      }
+    });
+    // Only the host sends players away.
+    this.onMessageBytes("k", (client: Client, data: Uint8Array) => {
+      if (this.ids.get(client.sessionId) !== 1 || !(data instanceof Uint8Array) || data.length < 4) {
+        return;
+      }
+      const bytes = new Uint8Array(data);
+      const id = new DataView(bytes.buffer, bytes.byteOffset, 4).getInt32(0, true);
+      if (id !== 1) {
+        this.games.get(id)?.leave(GobuRelayRoom.KICKED);
       }
     });
   }
