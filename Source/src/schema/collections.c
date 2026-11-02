@@ -267,6 +267,35 @@ void colyseus_array_schema_reverse(colyseus_array_schema_t* arr) {
     }
 }
 
+static int array_item_index_compare(const void* a, const void* b) {
+    const int ia = (*(colyseus_array_item_t* const*)a)->index;
+    const int ib = (*(colyseus_array_item_t* const*)b)->index;
+    return (ia > ib) - (ia < ib);
+}
+
+/* The items in index order (the list keeps them newest first). A new array the caller frees; NULL when empty. */
+static colyseus_array_item_t** array_sorted_items(colyseus_array_schema_t* arr, int* r_count) {
+    int count = 0;
+    for (colyseus_array_item_t* item = arr->items; item; item = item->next) {
+        count++;
+    }
+    *r_count = 0;
+    if (count == 0) {
+        return NULL;
+    }
+    colyseus_array_item_t** sorted = malloc(count * sizeof(colyseus_array_item_t*));
+    if (!sorted) {
+        return NULL;
+    }
+    int i = 0;
+    for (colyseus_array_item_t* item = arr->items; item; item = item->next) {
+        sorted[i++] = item;
+    }
+    qsort(sorted, count, sizeof(colyseus_array_item_t*), array_item_index_compare);
+    *r_count = count;
+    return sorted;
+}
+
 void colyseus_array_schema_on_decode_end(colyseus_array_schema_t* arr) {
     if (!arr || arr->deleted_count == 0) return;
 
@@ -292,16 +321,27 @@ void colyseus_array_schema_on_decode_end(colyseus_array_schema_t* arr) {
     }
 
     arr->deleted_count = 0;
+
+    /* The items left take the places of the deleted ones, as in @colyseus/schema: the server's next indices
+     * count only them. */
+    int count = 0;
+    colyseus_array_item_t** sorted = array_sorted_items(arr, &count);
+    for (int i = 0; i < count; i++) {
+        sorted[i]->index = i;
+    }
+    free(sorted);
 }
 
 void colyseus_array_schema_foreach(colyseus_array_schema_t* arr, colyseus_array_foreach_fn callback, void* userdata) {
     if (!arr || !callback) return;
 
-    colyseus_array_item_t* item = arr->items;
-    while (item) {
-        callback(item->index, item->value, userdata);
-        item = item->next;
+    /* In index order: an array's items as the server has them. */
+    int count = 0;
+    colyseus_array_item_t** sorted = array_sorted_items(arr, &count);
+    for (int i = 0; i < count; i++) {
+        callback(sorted[i]->index, sorted[i]->value, userdata);
     }
+    free(sorted);
 }
 
 colyseus_array_schema_t* colyseus_array_schema_clone(colyseus_array_schema_t* arr) {

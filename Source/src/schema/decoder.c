@@ -981,7 +981,10 @@ static bool decode_array_schema(colyseus_decoder_t* decoder, const uint8_t* byte
         value = decode_value(decoder, bytes, length, it,
             field_type, child_vtable, NULL, operation, previous_value);
 
-        if (value != NULL) {
+        /* As @colyseus/schema (value !== previousValue): the same child again at its index (the full state and
+         * a patch both carry what changed when a client joined) is not added twice; an ADD at index 0 of a
+         * non-empty array is an unshift, which would insert it again. */
+        if (value != NULL && value != previous_value) {
             colyseus_array_schema_set(arr, index, value, operation);
         }
     }

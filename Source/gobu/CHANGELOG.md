@@ -5,6 +5,16 @@ the repository's history.
 
 ## Gobu
 
+### Arrays of the state as the server has them
+- A child added once came twice: the full state and a patch both carry what changed when a client joined, and an
+  ADD at index 0 of a non-empty array is an unshift. The decoder now skips the same value at its index, as
+  @colyseus/schema does (`value !== previousValue`).
+- Items came out newest first: `colyseus_array_schema_foreach()` walked the list as kept (newest first); it
+  now goes in index order.
+- After a deletion, the items left kept their old indices, so the server's next change landed on the wrong one
+  (deleting the first item, then adding one, overwrote the second). `on_decode_end()` now compacts them, as
+  @colyseus/schema does and as its comment said.
+
 ### A game quits cleanly with a Colyseus session open
 - A game that quit with a room open crashed (an access violation, or a heap corruption) in two ways:
   - The WebSocket transport took any thread for its own tick thread: `ws_close_impl()` checked a shared
