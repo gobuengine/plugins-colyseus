@@ -5,6 +5,18 @@ the repository's history.
 
 ## Gobu
 
+### A game quits cleanly with a Colyseus session open
+- A game that quit with a room open crashed (an access violation, or a heap corruption) in two ways:
+  - The WebSocket transport took any thread for its own tick thread: `ws_close_impl()` checked a shared
+    `in_tick_thread` flag, true for every thread while the tick thread runs, so closing from the game deferred
+    the close and returned without waiting, and the transport was freed under the running thread. It now
+    compares the thread's identity, and from another thread waits for the tick thread before freeing the TLS
+    context, the socket and wslay (it freed them first).
+  - The `colyseus` provider left its room and client alive when Online closed the session ("a network thread may
+    still be using them"), so their threads ran on after Gobu unloaded the library. `provider_close()` now frees
+    the client (waiting for the matchmaking), then leaves and frees the room (waiting for its threads), and the
+    settings; a room matched after the close is freed in `on_matched()`.
+
 ### Only Gobu and Grost
 - `set_state_type()` takes the schema a game describes with `Colyseus.schema()` / `Colyseus.field()` (a
   Dictionary, or an Array of fields), nested schemas included (`colyseus_schema_definition.c`). Before, it took a

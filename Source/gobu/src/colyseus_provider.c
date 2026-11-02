@@ -70,6 +70,7 @@ typedef struct Event {
 
 typedef struct Connection {
 	GobuOnlineEvents events;
+	colyseus_settings_t *settings; /* The client's: it does not free them. */
 	colyseus_client_t *client;
 	colyseus_room_t *room;
 	Event *head;
@@ -175,7 +176,9 @@ static void on_matched(colyseus_room_t *p_room, void *p_userdata) {
 	}
 	MUTEX_UNLOCK(&live_mutex);
 	if (!open) {
+		/* Closed while matching: this room is nobody's. on_success is the last thing the SDK does with it. */
 		colyseus_room_leave(p_room, true);
+		colyseus_room_free(p_room);
 		return;
 	}
 	colyseus_room_on_message_bytes(p_room, "w", on_welcome, connection);
@@ -268,6 +271,7 @@ static void *provider_match(void *p_userdata, const char *p_mode, int32_t p_max_
 	if (ca_data && ca_size > 0) {
 		colyseus_settings_set_ca_certificates(settings, ca_data, ca_size);
 	}
+	connection->settings = settings;
 	connection->client = colyseus_client_create(settings);
 	free(address);
 	free(port_text);
@@ -368,10 +372,17 @@ static void provider_close(void *p_connection) {
 		free(event);
 		event = next;
 	}
+	/* Nothing of the plugin may run once the game is done with it (Gobu unloads its library at the end): every
+	 * network thread is waited for. First the matchmaking's: once the client is freed, on_matched has run or
+	 * never will (a room it made after this close is freed there: the connection is no longer live). */
+	colyseus_client_free(connection->client);
+	/* Then the room: leaving queues its last message, freeing it sends that and waits for its threads. Its
+	 * callbacks (on_leave) find the connection closed. */
 	if (connection->room) {
 		colyseus_room_leave(connection->room, true);
+		colyseus_room_free(connection->room);
 	}
-	/* The client and the room stay: a network thread may still be using them while it ends (a few bytes). */
+	colyseus_settings_free(connection->settings);
 	free(connection);
 }
 

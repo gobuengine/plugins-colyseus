@@ -127,7 +127,6 @@ colyseus_transport_t* colyseus_websocket_transport_create(const colyseus_transpo
     memset(data, 0, sizeof(colyseus_ws_transport_data_t));
     data->state = COLYSEUS_WS_DISCONNECTED;
     data->running = false;
-    data->in_tick_thread = false;
     data->pending_close = false;
     data->pending_close_code = 0;
     data->pending_close_reason = NULL;
@@ -213,32 +212,44 @@ static void ws_send_unreliable_impl(colyseus_transport_t* transport, const uint8
     (void)length;
 }
 
+/* Whether the caller is the tick thread itself (it must not wait for itself). Its identity, not a flag: a flag
+ * that says "the tick thread is running" is true for every other thread too while it runs. */
+static bool ws_on_tick_thread(const colyseus_ws_transport_data_t* data) {
+    if (!data->tick_thread) {
+        return false;
+    }
+#ifdef _WIN32
+    return GetThreadId((HANDLE)data->tick_thread) == GetCurrentThreadId();
+#else
+    return pthread_equal(*(const pthread_t*)data->tick_thread, pthread_self());
+#endif
+}
+
+/* Waits for the tick thread to return (it checks `running` every 10 ms) and releases its handle. */
+static void ws_join_tick_thread(colyseus_ws_transport_data_t* data) {
+    if (!data->tick_thread) {
+        return;
+    }
+#ifdef _WIN32
+    WaitForSingleObject(data->tick_thread, INFINITE);
+    CloseHandle(data->tick_thread);
+#else
+    pthread_t* thread = (pthread_t*)data->tick_thread;
+    pthread_join(*thread, NULL);
+    free(thread);
+#endif
+    data->tick_thread = NULL;
+}
+
 static void ws_close_impl(colyseus_transport_t* transport, int code, const char* reason) {
     colyseus_ws_transport_data_t* data = (colyseus_ws_transport_data_t*)transport->impl_data;
 
-    if (data->state == COLYSEUS_WS_DISCONNECTED) {
-        /* Already disconnected via deferred close from the tick thread.
-         * The tick thread function has returned by now (or is about to),
-         * but the OS handle hasn't been reaped yet — join it before
-         * destroy() releases the surrounding struct. */
-        if (data->tick_thread) {
-#ifdef _WIN32
-            WaitForSingleObject(data->tick_thread, INFINITE);
-            CloseHandle(data->tick_thread);
-            data->tick_thread = NULL;
-#else
-            pthread_t* thread = (pthread_t*)data->tick_thread;
-            pthread_join(*thread, NULL);
-            free(thread);
-            data->tick_thread = NULL;
-#endif
+    /* From within the tick thread (a receive error, the server's close): it can't wait for itself, so the
+     * close is deferred to the end of its loop. */
+    if (ws_on_tick_thread(data)) {
+        if (data->state == COLYSEUS_WS_DISCONNECTED) {
+            return;
         }
-        return;
-    }
-
-    /* If we're being called from within the tick thread, defer the close.
-     * We cannot pthread_join() on ourselves - that would deadlock. */
-    if (data->in_tick_thread) {
         WS_LOG("Close called from tick thread - deferring");
         data->pending_close = true;
         data->pending_close_code = code;
@@ -248,7 +259,14 @@ static void ws_close_impl(colyseus_transport_t* transport, int code, const char*
         return;
     }
 
+    /* Any other thread: stop the tick thread and wait for it before touching what it uses (the TLS context,
+     * the socket, wslay), and before destroy() frees the transport. */
     data->running = false;
+    ws_join_tick_thread(data);
+
+    if (data->state == COLYSEUS_WS_DISCONNECTED) {
+        return;  /* Never connected, or the tick thread's deferred close did it all. */
+    }
 
     if (data->wslay_ctx && data->state == COLYSEUS_WS_CONNECTED) {
         wslay_event_queue_close(data->wslay_ctx, code, (const uint8_t*)reason, reason ? strlen(reason) : 0);
@@ -258,22 +276,6 @@ static void ws_close_impl(colyseus_transport_t* transport, int code, const char*
     ws_tls_cleanup(data);
     ws_socket_close(data);
     ws_cleanup_wslay(data);
-
-    /* Wait for thread */
-#ifdef _WIN32
-    if (data->tick_thread) {
-        WaitForSingleObject(data->tick_thread, INFINITE);
-        CloseHandle(data->tick_thread);
-        data->tick_thread = NULL;
-    }
-#else
-    if (data->tick_thread) {
-        pthread_t* thread = (pthread_t*)data->tick_thread;
-        pthread_join(*thread, NULL);
-        free(thread);
-        data->tick_thread = NULL;
-    }
-#endif
 
     data->state = COLYSEUS_WS_DISCONNECTED;
 
@@ -311,8 +313,6 @@ static thread_return_t THREAD_CALL ws_tick_thread_func(void* arg) {
     colyseus_transport_t* transport = (colyseus_transport_t*)arg;
     colyseus_ws_transport_data_t* data = (colyseus_ws_transport_data_t*)transport->impl_data;
 
-    data->in_tick_thread = true;
-
     while (data->running) {
         ws_tick_once(transport);
 
@@ -322,8 +322,6 @@ static thread_return_t THREAD_CALL ws_tick_thread_func(void* arg) {
         usleep(10000);  /* 10ms */
 #endif
     }
-
-    data->in_tick_thread = false;
 
     /* Handle deferred close (was requested from within tick thread) */
     if (data->pending_close) {
