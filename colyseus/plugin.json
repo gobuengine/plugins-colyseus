@@ -7,6 +7,7 @@
 	"category": "Network",
 	"api_version": 1,
 	"entry": "gobu_plugin_init",
+	"android_permissions": ["INTERNET"],
 	"libraries": {
 		"windows.x86_64.debug": "bin/colyseus_gobu.windows.x86_64.debug.dll",
 		"windows.x86_64": "bin/colyseus_gobu.windows.x86_64.release.dll",

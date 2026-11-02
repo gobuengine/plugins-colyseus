@@ -10,6 +10,9 @@ the repository's history.
   (`ANDROID_NDK_HOME`). The release goes without its debug sections, with the NDK's `llvm-strip` (2.7 MB instead
   of 15; Zig's own strip makes it build compiler_rt's tests). The export puts it in the package's
   `lib/arm64-v8a`; it needs Gobu's Android templates with plugins.
+- `plugin.json` asks for `INTERNET` (`android_permissions`): without it Android doesn't let the game reach the
+  server, and an Android export of a game with the plugin enabled now asks for it. Tried on a phone (Android
+  11, arm64): it hosts a room a game on a computer joins.
 
 ### Host, Join and a dedicated server
 - The `colyseus` provider opens and joins games too, not only matches: `Online.host()` and `Online.serve()`
