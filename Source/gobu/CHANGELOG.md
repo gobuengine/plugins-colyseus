@@ -5,6 +5,10 @@ the repository's history.
 
 ## Gobu
 
+### Plugins window
+- `icon.svg` (a colosseum) and `"icon"` in `plugin.json`: its image in Gobu's Edit > Plugins, which installs it
+  from this repository's latest release (`forja package plugin colyseus` makes its files).
+
 ### Android
 - `plugin.json` has the Android libraries (`android.arm64`, `android.arm64.debug`): built with Zig and the NDK
   (`ANDROID_NDK_HOME`). The release goes without its debug sections, with the NDK's `llvm-strip` (2.7 MB instead
