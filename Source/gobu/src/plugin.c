@@ -19,7 +19,7 @@ static void add_class(const char *class_name, GobuCreateInstanceFunc create_inst
     GobuClassInfo info;
     memset(&info, 0, sizeof(info));
     info.name = class_name;
-    info.parent = "RefCounted";
+    info.parent = "Shared"; /* Gobu renamed RefCounted (2026-11-04). */
     info.create_instance = create_instance;
     info.free_instance = free_instance;
     gobu->register_class(gobu_plugin, &info);
