@@ -1,12 +1,12 @@
 {
 	"id": "colyseus",
 	"name": "Colyseus",
-	"version": "0.18.0",
+	"version": "0.18.1",
 	"description": "Colyseus multiplayer client: matchmaking, rooms, state sync, messages and auth; the \"colyseus\" provider for Gobu Online.",
 	"author": "Endel Dreyer",
 	"category": "Network",
 	"icon": "icon.svg",
-	"api_version": 1,
+	"api_version": 4,
 	"entry": "gobu_plugin_init",
 	"android_permissions": ["INTERNET"],
 	"libraries": {
