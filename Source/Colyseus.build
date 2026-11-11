@@ -1,0 +1,20 @@
+# The Colyseus plugin's folder (../colyseus: plugin.json, colyseus.gro, the icon and the libraries) among the
+# plugins that come with Gobu, next to the editor: Engine/Binaries/plugins/colyseus. Gobu reads this folder through
+# Engine/Source/external_plugins.txt.
+#
+# The libraries are not built here: Zig builds them (gobu/build.zig, see README.md) into ../colyseus/bin, and this
+# repository keeps them. Forja only copies them.
+module PluginColyseusBundle {
+	standalone = true
+	generate {
+		copy "../colyseus/plugin.json" "out=//Engine/Binaries/plugins/colyseus/plugin.json"
+		copy "../colyseus/colyseus.gro" "out=//Engine/Binaries/plugins/colyseus/colyseus.gro"
+		copy "../colyseus/icon.svg" "out=//Engine/Binaries/plugins/colyseus/icon.svg"
+		copy "../colyseus/bin/colyseus_gobu.windows.x86_64.debug.dll" "out=//Engine/Binaries/plugins/colyseus/bin/colyseus_gobu.windows.x86_64.debug.dll"
+		copy "../colyseus/bin/colyseus_gobu.windows.x86_64.release.dll" "out=//Engine/Binaries/plugins/colyseus/bin/colyseus_gobu.windows.x86_64.release.dll"
+		copy "../colyseus/bin/libcolyseus_gobu.web.wasm32.debug.wasm" "out=//Engine/Binaries/plugins/colyseus/bin/libcolyseus_gobu.web.wasm32.debug.wasm"
+		copy "../colyseus/bin/libcolyseus_gobu.web.wasm32.release.wasm" "out=//Engine/Binaries/plugins/colyseus/bin/libcolyseus_gobu.web.wasm32.release.wasm"
+		copy "../colyseus/bin/libcolyseus_gobu.android.arm64.debug.so" "out=//Engine/Binaries/plugins/colyseus/bin/libcolyseus_gobu.android.arm64.debug.so"
+		copy "../colyseus/bin/libcolyseus_gobu.android.arm64.release.so" "out=//Engine/Binaries/plugins/colyseus/bin/libcolyseus_gobu.android.arm64.release.so"
+	}
+}

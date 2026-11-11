@@ -1,0 +1,5 @@
+# The Colyseus plugin (Gobu reads this folder through Engine/Source/external_plugins.txt): `forja build PluginColyseus`
+# puts the plugin among the ones that come with Gobu. Its libraries come built (Zig, gobu/build.zig): nothing compiles.
+target PluginColyseus {
+	modules = [PluginColyseusBundle]
+}
