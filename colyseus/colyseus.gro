@@ -191,11 +191,10 @@ static fn _replies_track(native: _ColyseusClient, request_id: int, callback: Cal
 	return request_id
 }
 
-static fn _replies_take(native: _ColyseusClient, request_id: int) Callable {
-	if native == null {
-		return Callable()
-	}
-	key := native.get_instance_id()
+## `client_id`: the native client's instance id (the answers' handlers hold the id, not the client: holding it
+## from its own signals, the client would never be freed).
+static fn _replies_take(client_id: int, request_id: int) Callable {
+	key := client_id
 	if not _replies.has(key) or not _replies[key].has(request_id) {
 		return Callable()
 	}
@@ -207,8 +206,8 @@ static fn _replies_take(native: _ColyseusClient, request_id: int) Callable {
 ## Every request answers `callback(err: Dictionary, data: Dictionary)`: `err` is empty when it went well,
 ## else `{ "code": int, "message": String }`; `data` is the reply's JSON object (other JSON in
 ## `data["value"]`, a reply that isn't JSON in `data["text"]`).
-static fn _on_http_response(native: _ColyseusClient, request_id: int, _status_code: int, body: String) void {
-	callback := _replies_take(native, request_id)
+static fn _on_http_response(client_id: int, request_id: int, _status_code: int, body: String) void {
+	callback := _replies_take(client_id, request_id)
 	if not callback.is_valid() {
 		return
 	}
@@ -220,8 +219,8 @@ static fn _on_http_response(native: _ColyseusClient, request_id: int, _status_co
 	callback.call({}, data)
 }
 
-static fn _on_http_error(native: _ColyseusClient, request_id: int, code: int, message: String) void {
-	callback := _replies_take(native, request_id)
+static fn _on_http_error(client_id: int, request_id: int, code: int, message: String) void {
+	callback := _replies_take(client_id, request_id)
 	if callback.is_valid() {
 		callback.call({ "code": code, "message": message }, {})
 	}
@@ -577,10 +576,10 @@ impl Client {
 			return client
 		}
 
-		# HTTP and Auth share one reply table (request_id -> Callable), kept by the client's native object.
-		native : _ColyseusClient = client.native
-		mut on_response := fn(request_id: int, status_code: int, body: String) { _on_http_response(native, request_id, status_code, body) }
-		mut on_error := fn(request_id: int, code: int, message: String) { _on_http_error(native, request_id, code, message) }
+		# HTTP and Auth share one reply table (request_id -> Callable), found by the client's id.
+		client_id : int = client.native.get_instance_id()
+		mut on_response := fn(request_id: int, status_code: int, body: String) { _on_http_response(client_id, request_id, status_code, body) }
+		mut on_error := fn(request_id: int, code: int, message: String) { _on_http_error(client_id, request_id, code, message) }
 		client.native._http_response.connect(on_response)
 		client.native._http_error.connect(on_error)
 		client.http = HTTP{ .native = client.native }
