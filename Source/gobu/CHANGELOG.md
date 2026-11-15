@@ -5,6 +5,28 @@ the repository's history.
 
 ## Gobu
 
+### 0.18.2: the Grost module for today's Grost
+- `colyseus.gro` compiles again: Grost removed `any` and values of unknown type (2026-11-03), and the module
+  still had them (151 errors), so a game that used `Colyseus.*` didn't compile. The native objects are typed
+  (`_ColyseusClient`, `_ColyseusRoom`, `_ColyseusCallbacks`); the Online provider (`colyseus_provider.c`) never
+  used the module and is unchanged.
+- Typed where it took any value: `Callbacks.listen/on_add/on_remove(property, callback, target = {})` and
+  `on_change(callback, property = "", target = {})` (`target`: a nested schema; none = the root state);
+  `room.send_message(type: String, data: Dictionary = {})` and `send_message_int(type: int, data)` (an empty
+  `data` sends none); `room.set_state_type(schema)` and `set_state_type_name(name)`; `Colyseus.field(name, type)`,
+  `field_of(name, type, schema)` and `field_of_type(name, type, child_type)`; `schema(fields: []Dictionary)`;
+  HTTP bodies are Dictionaries.
+- HTTP and Auth answer `callback(err: Dictionary, data: Dictionary)`: `err` empty when it went well, else
+  `{ "code", "message" }`; `data` the reply's JSON object (other JSON in `data["value"]`, text in `data["text"]`).
+- The reply table HTTP and Auth share lives in the module (one per client), not in a Dictionary each struct held:
+  a Dictionary is a value in Grost now.
+- Out: the predict layer's wrappers (`InputHandle`, `Clock`, `Predict`, `Spawns`, `EventChannel`, `Reconciler`,
+  `room.input()/predict()/clock()/set_latency()/net_pump()/drop()`): they called native methods this binding
+  never had. Also `get_default_value()`, which had no single type.
+- Tried against a local server with a room of its own: HTTP (a reply and a 404), Auth's error, join, messages by
+  name and by number, the state, `on_add`, leave. Known: `listen()` on a `number` field gives null values: the
+  binding's `native_value_to_variant` has no case for `COLYSEUS_FIELD_NUMBER` (it needs the libraries rebuilt).
+
 ### Plugins window
 - `icon.svg` (a colosseum) and `"icon"` in `plugin.json`: its image in Gobu's Edit > Plugins, which installs it
   from this repository's latest release (`forja package plugin colyseus` makes its files).
