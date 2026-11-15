@@ -76,6 +76,8 @@ static void register_colyseus_client(void) {
     gobu->variant_destroy(&no_options); // The engine keeps its own copy.
     const GobuArgInfo token[] = { ARG("reconnection_token", STRING) };
     add_method(cls, "reconnect", gobuext_colyseus_client_reconnect, 0, GOBU_TYPE_OBJECT, token, 1);
+    const GobuArgInfo reservation[] = { ARG("reservation_json", STRING) };
+    add_method(cls, "consume_seat_reservation", gobuext_colyseus_client_consume_seat_reservation, 0, GOBU_TYPE_OBJECT, reservation, 1);
 
     // HTTP and auth requests answer with these: (request id, status code or error code, body or message)
     const GobuArgInfo response[] = { ARG("request_id", INT), ARG("status_code", INT), ARG("body", STRING) };
@@ -99,6 +101,12 @@ static void register_colyseus_client(void) {
     add_method(cls, "auth_get_token", gobuext_colyseus_client_auth_get_token, 0, GOBU_TYPE_STRING, NULL, 0);
     add_method(cls, "auth_signout", gobuext_colyseus_client_auth_signout, 0, NO_RETURN, NULL, 0);
 
+    // Latency, answered as the HTTP requests are (0 for ping_count and timeout_ms: the SDK's, 1 and 1500 ms)
+    const GobuArgInfo latency[] = { ARG("endpoint", STRING), ARG("ping_count", INT), ARG("timeout_ms", INT) };
+    const GobuArgInfo select[] = { ARG("endpoints", STRING), ARG("ping_count", INT), ARG("timeout_ms", INT) };
+    add_method(cls, "get_latency", gobuext_colyseus_client_get_latency, 0, GOBU_TYPE_INT, latency, ARG_COUNT(latency));
+    add_method(cls, "select_by_latency", gobuext_colyseus_client_select_by_latency, 0, GOBU_TYPE_INT, select, ARG_COUNT(select));
+
     add_method(cls, "poll", gobuext_colyseus_client_poll, GOBU_METHOD_STATIC, NO_RETURN, NULL, 0);
 }
 
@@ -116,6 +124,10 @@ static void register_colyseus_room(void) {
     gobu->register_signal(gobu_plugin, cls, "error", code_message, 2);
     gobu->register_signal(gobu_plugin, cls, "left", code_reason, 2);
     gobu->register_signal(gobu_plugin, cls, "dropped", code_reason, 2);
+    const GobuArgInfo rtt[] = { ARG("rtt_ms", INT) };
+    gobu->register_signal(gobu_plugin, cls, "pong", rtt, 1);
+    const GobuArgInfo reply[] = { ARG("request_id", INT), ARG("outcome", INT), ANY("data"), ARG("reason", STRING) };
+    gobu->register_signal(gobu_plugin, cls, "_request_reply", reply, 4);
 
     // The data of a message: any value (it goes as msgpack)
     const GobuArgInfo send[] = { ARG("type", STRING), ANY("data") };
@@ -123,6 +135,11 @@ static void register_colyseus_room(void) {
     add_method(cls, "send_message", gobuext_colyseus_room_send_message, 0, NO_RETURN, send, 2);
     add_method(cls, "send_message_int", gobuext_colyseus_room_send_message_int, 0, NO_RETURN, send_int, 2);
     add_method(cls, "leave", gobuext_colyseus_room_leave, 0, NO_RETURN, NULL, 0);
+    const GobuArgInfo request[] = { ARG("type", STRING), ANY("data") };
+    const GobuArgInfo request_id[] = { ARG("request_id", INT) };
+    add_method(cls, "request", gobuext_colyseus_room_request, 0, GOBU_TYPE_INT, request, 2);
+    add_method(cls, "cancel_request", gobuext_colyseus_room_cancel_request, 0, NO_RETURN, request_id, 1);
+    add_method(cls, "ping", gobuext_colyseus_room_ping, 0, GOBU_TYPE_BOOL, NULL, 0);
 
     add_method(cls, "get_id", gobuext_colyseus_room_get_id, 0, GOBU_TYPE_STRING, NULL, 0);
     add_method(cls, "get_session_id", gobuext_colyseus_room_get_session_id, 0, GOBU_TYPE_STRING, NULL, 0);
@@ -179,6 +196,12 @@ GOBU_PLUGIN_EXPORT bool gobu_plugin_init(const GobuPluginApi *p_api, GobuPluginH
 
     // TLS certificates: an override from Project Settings, if any
     gobuext_tls_certificates_init();
+
+#ifndef __EMSCRIPTEN__
+    // Every SDK callback (sockets, matchmaking answers, reconnection, latency) runs in colyseus_poll(), on the main
+    // thread: the state is never decoded while the game reads it. The web has one thread already.
+    colyseus_set_polled(true);
+#endif
 
     register_colyseus_client();
     register_colyseus_room();

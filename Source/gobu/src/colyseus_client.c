@@ -4,6 +4,7 @@
 #include <colyseus/auth/auth.h>
 #include <colyseus/client.h>
 #include <colyseus/http.h>
+#include <colyseus/latency.h>
 #include <colyseus/room.h>
 #include <colyseus/settings.h>
 #include <colyseus/schema/types.h>
@@ -41,12 +42,15 @@ typedef enum {
     ROOM_EVENT_MESSAGE,
     ROOM_EVENT_DROP,
     ROOM_EVENT_RECONNECT,
+    ROOM_EVENT_REPLY,       // a request()'s reply: `code` is its outcome
+    ROOM_EVENT_PONG,        // a ping()'s answer: `code` is the round trip in ms
 } gobuext_room_event_type_t;
 
 typedef struct gobuext_room_event {
     gobuext_room_event_type_t type;
     GobuObjectId room_id;   // The _ColyseusRoom: resolved on the main thread, it may be gone by then
     int code;               // for error/leave
+    uint32_t request_id;    // for a reply
     char* str_data;         // message (error/leave reason), or message type
     uint8_t* binary_data;   // message payload (msgpack)
     size_t binary_len;
@@ -243,17 +247,21 @@ static void on_room_state_change(void* userdata) {
     room_event_push(event);
 }
 
-static void on_room_error(int code, const char* message, void* userdata) {
-    ColyseusRoomWrapper* room_wrapper = (ColyseusRoomWrapper*)userdata;
-    if (!room_wrapper || !room_wrapper->object_id) return;
-
+// Queues the `error` signal of the room `p_room_id`.
+static void room_error_queue(GobuObjectId p_room_id, int p_code, const char* p_message) {
     gobuext_room_event_t* event = (gobuext_room_event_t*)calloc(1, sizeof(gobuext_room_event_t));
     if (!event) return;
     event->type = ROOM_EVENT_ERROR;
-    event->room_id = room_wrapper->object_id;
-    event->code = code;
-    event->str_data = message ? strdup(message) : strdup("");
+    event->room_id = p_room_id;
+    event->code = p_code;
+    event->str_data = strdup(p_message ? p_message : "");
     room_event_push(event);
+}
+
+static void on_room_error(int code, const char* message, void* userdata) {
+    ColyseusRoomWrapper* room_wrapper = (ColyseusRoomWrapper*)userdata;
+    if (!room_wrapper || !room_wrapper->object_id) return;
+    room_error_queue(room_wrapper->object_id, code, message);
 }
 
 static void on_room_leave(int code, const char* reason, void* userdata) {
@@ -293,10 +301,52 @@ static void on_room_reconnect(void* userdata) {
     room_event_push(event);
 }
 
+void gobuext_room_queue_reply(GobuObjectId p_room_id, uint32_t p_request_id, int p_outcome, const uint8_t* p_data,
+    size_t p_length, const char* p_reason) {
+    gobuext_room_event_t* event = (gobuext_room_event_t*)calloc(1, sizeof(gobuext_room_event_t));
+    if (!event) return;
+    event->type = ROOM_EVENT_REPLY;
+    event->room_id = p_room_id;
+    event->request_id = p_request_id;
+    event->code = p_outcome;
+    event->str_data = strdup(p_reason ? p_reason : "");
+    if (p_data && p_length > 0) {
+        event->binary_data = (uint8_t*)malloc(p_length);
+        if (event->binary_data) {
+            memcpy(event->binary_data, p_data, p_length);
+            event->binary_len = p_length;
+        }
+    }
+    room_event_push(event);
+}
+
+void gobuext_room_queue_pong(GobuObjectId p_room_id, int p_rtt_ms) {
+    gobuext_room_event_t* event = (gobuext_room_event_t*)calloc(1, sizeof(gobuext_room_event_t));
+    if (!event) return;
+    event->type = ROOM_EVENT_PONG;
+    event->room_id = p_room_id;
+    event->code = p_rtt_ms;
+    room_event_push(event);
+}
+
+// The room a matchmaking request is for, by its id: the game may drop the room before the answer comes. The SDK
+// answers in colyseus_poll(), on the main thread (natively it is polled, plugin.c; the web has one thread).
+typedef struct {
+    GobuObjectId room_id;
+} matchmaking_request_t;
+
 // Matchmaking success callback (shared by all matchmaking methods)
 static void on_matchmaking_success(colyseus_room_t* room, void* userdata) {
-    ColyseusRoomWrapper* room_wrapper = (ColyseusRoomWrapper*)userdata;
-    if (!room_wrapper) return;
+    matchmaking_request_t* request = (matchmaking_request_t*)userdata;
+    GobuObject* object = gobu->object_from_instance_id(request->room_id);
+    ColyseusRoomWrapper* room_wrapper = object ? gobuext_colyseus_room_get_wrapper(object) : NULL;
+    free(request);
+    if (!room_wrapper) {
+        // Nobody's room: on_success is the last thing the SDK does with it.
+        colyseus_room_leave(room, true);
+        colyseus_room_free(room);
+        return;
+    }
 
     // Apply pending vtable BEFORE assigning native room (so it's set before join message processing)
     if (room_wrapper->pending_vtable) {
@@ -318,10 +368,18 @@ static void on_matchmaking_success(colyseus_room_t* room, void* userdata) {
 
 // Matchmaking error callback (shared by all matchmaking methods)
 static void on_matchmaking_error(int code, const char* message, void* userdata) {
-    ColyseusRoomWrapper* room_wrapper = (ColyseusRoomWrapper*)userdata;
-    if (room_wrapper) {
-        on_room_error(code, message, room_wrapper);
+    matchmaking_request_t* request = (matchmaking_request_t*)userdata;
+    room_error_queue(request->room_id, code, message);
+    free(request);
+}
+
+// A matchmaking request for the room of `p_wrapper`; NULL when out of memory.
+static matchmaking_request_t* matchmaking_request(const ColyseusRoomWrapper* p_wrapper) {
+    matchmaking_request_t* request = (matchmaking_request_t*)malloc(sizeof(matchmaking_request_t));
+    if (request) {
+        request->room_id = p_wrapper->object_id;
     }
+    return request;
 }
 
 // =============================================================================
@@ -332,8 +390,8 @@ static void on_matchmaking_error(int code, const char* message, void* userdata) 
 typedef void (*matchmaking_with_options_fn)(colyseus_client_t*, const char*, const char*,
     colyseus_client_room_callback_t, colyseus_client_error_callback_t, void*);
 
-// Function pointer type for reconnect (client, token, callbacks — no options)
-typedef void (*matchmaking_reconnect_fn)(colyseus_client_t*, const char*,
+// Function pointer type for reconnect and consume_seat_reservation (client, one text, callbacks — no options)
+typedef void (*matchmaking_one_text_fn)(colyseus_client_t*, const char*,
     colyseus_client_room_callback_t, colyseus_client_error_callback_t, void*);
 
 // A new _ColyseusRoom in `r_return` (which holds it), and its data; NULL if it could not be made.
@@ -353,7 +411,8 @@ static void matchmaking_with_options(void* p_instance, const GobuVariant* const*
         return;  // null
     }
     ColyseusRoomWrapper* room_wrapper = new_room(r_return);
-    if (!room_wrapper) {
+    matchmaking_request_t* request = room_wrapper ? matchmaking_request(room_wrapper) : NULL;
+    if (!request) {
         return;
     }
 
@@ -365,7 +424,7 @@ static void matchmaking_with_options(void* p_instance, const GobuVariant* const*
         options_cstr,
         on_matchmaking_success,
         on_matchmaking_error,
-        room_wrapper
+        request
     );
     free(arg_cstr);
     free(options_cstr);
@@ -391,29 +450,34 @@ GOBUEXT_METHOD(gobuext_colyseus_client_join_by_id) {
     matchmaking_with_options(p_instance, p_args, r_return, colyseus_client_join_by_id);
 }
 
-// reconnect(reconnection_token: String): the seat the server holds with allowReconnection()
-GOBUEXT_METHOD(gobuext_colyseus_client_reconnect) {
-    (void)p_method_userdata; (void)p_argument_count; (void)r_error;
-
+// The matchmaking methods of one text (reconnect, consume_seat_reservation): as matchmaking_with_options().
+static void matchmaking_one_text(void* p_instance, const GobuVariant* p_text, GobuVariant* r_return,
+    matchmaking_one_text_fn native_fn) {
     ColyseusClientWrapper* client_wrapper = (ColyseusClientWrapper*)p_instance;
     if (!client_wrapper || !client_wrapper->native_client) {
         return;  // null
     }
     ColyseusRoomWrapper* room_wrapper = new_room(r_return);
-    if (!room_wrapper) {
+    matchmaking_request_t* request = room_wrapper ? matchmaking_request(room_wrapper) : NULL;
+    if (!request) {
         return;
     }
 
-    char* token_cstr = gobuext_to_utf8(p_args[0]);
-    matchmaking_reconnect_fn native_fn = colyseus_client_reconnect;
-    native_fn(
-        client_wrapper->native_client,
-        token_cstr,
-        on_matchmaking_success,
-        on_matchmaking_error,
-        room_wrapper
-    );
-    free(token_cstr);
+    char* text = gobuext_to_utf8(p_text);
+    native_fn(client_wrapper->native_client, text, on_matchmaking_success, on_matchmaking_error, request);
+    free(text);
+}
+
+// reconnect(reconnection_token: String): the seat the server holds with allowReconnection()
+GOBUEXT_METHOD(gobuext_colyseus_client_reconnect) {
+    (void)p_method_userdata; (void)p_argument_count; (void)r_error;
+    matchmaking_one_text(p_instance, p_args[0], r_return, colyseus_client_reconnect);
+}
+
+// consume_seat_reservation(reservation_json: String): a seat the server reserved for this player
+GOBUEXT_METHOD(gobuext_colyseus_client_consume_seat_reservation) {
+    (void)p_method_userdata; (void)p_argument_count; (void)r_error;
+    matchmaking_one_text(p_instance, p_args[0], r_return, colyseus_client_consume_seat_reservation_json);
 }
 
 // =============================================================================
@@ -497,6 +561,23 @@ static gobuext_room_event_t* room_event_pop(void) {
     return event;
 }
 
+// Queues an answer for the _http_response / _http_error signals of the client `p_client_id`. Takes `p_text`.
+static void http_event_queue(GobuObjectId p_client_id, int64_t p_request_id, bool p_is_error, int p_status_or_code,
+    char* p_text) {
+    gobuext_http_event_t* event = (gobuext_http_event_t*)calloc(1, sizeof(gobuext_http_event_t));
+    if (!event || !p_text) {
+        free(event);
+        free(p_text);
+        return;
+    }
+    event->is_error = p_is_error;
+    event->request_id = p_request_id;
+    event->status_or_code = p_status_or_code;
+    event->body_or_message = p_text;
+    event->client_id = p_client_id;
+    http_event_push(event);
+}
+
 static void room_event_free(gobuext_room_event_t* event) {
     if (event->str_data) free(event->str_data);
     if (event->binary_data) free(event->binary_data);
@@ -550,30 +631,15 @@ static void gobuext_http_request_answered(gobuext_http_request_t* req) {
 // HTTP success trampoline — pushes to event queue (processed in poll)
 static void on_gobuext_http_success(const colyseus_http_response_t* response, void* userdata) {
     gobuext_http_request_t* req = (gobuext_http_request_t*)userdata;
-
-    gobuext_http_event_t* event = (gobuext_http_event_t*)calloc(1, sizeof(gobuext_http_event_t));
-    if (!event) return;
-    event->is_error = 0;
-    event->request_id = req->request_id;
-    event->status_or_code = response->status_code;
-    event->body_or_message = response->body ? strdup(response->body) : strdup("");
-    event->client_id = req->client_id;
-    http_event_push(event);
+    http_event_queue(req->client_id, req->request_id, false, response->status_code,
+        strdup(response->body ? response->body : ""));
     gobuext_http_request_answered(req);
 }
 
 // HTTP error trampoline — pushes to event queue (processed in poll)
 static void on_gobuext_http_error(const colyseus_http_error_t* error, void* userdata) {
     gobuext_http_request_t* req = (gobuext_http_request_t*)userdata;
-
-    gobuext_http_event_t* event = (gobuext_http_event_t*)calloc(1, sizeof(gobuext_http_event_t));
-    if (!event) return;
-    event->is_error = 1;
-    event->request_id = req->request_id;
-    event->status_or_code = error->code;
-    event->body_or_message = error->message ? strdup(error->message) : strdup("");
-    event->client_id = req->client_id;
-    http_event_push(event);
+    http_event_queue(req->client_id, req->request_id, true, error->code, strdup(error->message ? error->message : ""));
     gobuext_http_request_answered(req);
 }
 
@@ -585,34 +651,18 @@ static void on_gobuext_auth_success(const colyseus_auth_data_t* data, void* user
     const char* token = data && data->token ? data->token : "";
     size_t size = strlen(user) + strlen(token) + 32;
     char* body = (char*)malloc(size);
-    gobuext_http_event_t* event = (gobuext_http_event_t*)calloc(1, sizeof(gobuext_http_event_t));
-    if (body && event) {
+    if (body) {
         // The token is a JWT (base64url and dots): nothing to escape.
         snprintf(body, size, "{\"user\":%s,\"token\":\"%s\"}", user, token);
-        event->is_error = 0;
-        event->request_id = req->request_id;
-        event->status_or_code = 200;
-        event->body_or_message = body;
-        event->client_id = req->client_id;
-        http_event_push(event);
-    } else {
-        free(body);
-        free(event);
     }
+    http_event_queue(req->client_id, req->request_id, false, 200, body);
     gobuext_http_request_answered(req);
 }
 
 static void on_gobuext_auth_error(const char* message, void* userdata) {
     gobuext_http_request_t* req = (gobuext_http_request_t*)userdata;
-    gobuext_http_event_t* event = (gobuext_http_event_t*)calloc(1, sizeof(gobuext_http_event_t));
-    if (event) {
-        event->is_error = 1;
-        event->request_id = req->request_id;
-        event->status_or_code = 0;  // The SDK's auth reports only a message.
-        event->body_or_message = strdup(message ? message : "");
-        event->client_id = req->client_id;
-        http_event_push(event);
-    }
+    // The SDK's auth reports only a message.
+    http_event_queue(req->client_id, req->request_id, true, 0, strdup(message ? message : ""));
     gobuext_http_request_answered(req);
 }
 
@@ -712,6 +762,169 @@ static int64_t gobuext_http_dispatch(ColyseusClientWrapper* wrapper, int method,
 }
 
 // =============================================================================
+// Latency — answered as an HTTP request: `{"endpoint": "ws://...", "latency_ms": 12.5}`, or an error
+// =============================================================================
+
+typedef struct {
+    int64_t request_id;
+    GobuObjectId client_id;
+} gobuext_latency_request_t;
+
+// `{"endpoint":"...","latency_ms":...}`, malloc'd.
+static char* latency_json(const char* p_endpoint, double p_latency_ms) {
+    const char* endpoint = p_endpoint ? p_endpoint : "";
+    char* json = (char*)malloc(strlen(endpoint) * 6 + 64);
+    if (!json) return NULL;
+    char* out = json + sprintf(json, "{\"endpoint\":\"");
+    for (const unsigned char* c = (const unsigned char*)endpoint; *c; c++) {
+        if (*c == '"' || *c == '\\') {
+            *out++ = '\\';
+            *out++ = (char)*c;
+        } else if (*c < 0x20) {
+            out += sprintf(out, "\\u%04x", *c);
+        } else {
+            *out++ = (char)*c;
+        }
+    }
+    sprintf(out, "\",\"latency_ms\":%.3f}", p_latency_ms);
+    return json;
+}
+
+static void on_gobuext_latency(const colyseus_latency_result_t* p_result, void* p_userdata) {
+    gobuext_latency_request_t* req = (gobuext_latency_request_t*)p_userdata;
+    if (p_result->ok) {
+        http_event_queue(req->client_id, req->request_id, false, 200, latency_json(p_result->endpoint, p_result->latency_ms));
+    } else {
+        http_event_queue(req->client_id, req->request_id, true, p_result->error_code,
+            strdup(p_result->error ? p_result->error : "The latency could not be measured."));
+    }
+    free(req);
+}
+
+static void on_gobuext_select_by_latency(const char* p_best_endpoint, double p_best_latency_ms, void* p_userdata) {
+    gobuext_latency_request_t* req = (gobuext_latency_request_t*)p_userdata;
+    if (p_best_endpoint) {
+        http_event_queue(req->client_id, req->request_id, false, 200, latency_json(p_best_endpoint, p_best_latency_ms));
+    } else {
+        http_event_queue(req->client_id, req->request_id, true, 1006, strdup("No endpoint answered."));
+    }
+    free(req);
+}
+
+// A ws:// or wss:// address of `p_endpoint` ("http://..." and "https://..." become those), malloc'd.
+static char* websocket_url(const char* p_endpoint) {
+    const char* rest = p_endpoint;
+    const char* scheme = "ws://";
+    if (strncmp(p_endpoint, "https://", 8) == 0) {
+        rest = p_endpoint + 8;
+        scheme = "wss://";
+    } else if (strncmp(p_endpoint, "http://", 7) == 0) {
+        rest = p_endpoint + 7;
+    } else if (strncmp(p_endpoint, "wss://", 6) == 0) {
+        rest = p_endpoint + 6;
+        scheme = "wss://";
+    } else if (strncmp(p_endpoint, "ws://", 5) == 0) {
+        rest = p_endpoint + 5;
+    }
+    char* url = (char*)malloc(strlen(scheme) + strlen(rest) + 1);
+    if (url) {
+        strcpy(url, scheme);
+        strcat(url, rest);
+    }
+    return url;
+}
+
+// The options of a measurement: the counts given (0: the SDK's), and the client's certificates.
+static colyseus_latency_options_t latency_options(const ColyseusClientWrapper* p_wrapper, const GobuVariant* p_ping_count,
+    const GobuVariant* p_timeout_ms, bool p_secure) {
+    colyseus_latency_options_t options;
+    memset(&options, 0, sizeof(options));
+    options.ping_count = (int)gobu->variant_to_int(p_ping_count);
+    options.timeout_ms = (int)gobu->variant_to_int(p_timeout_ms);
+    options.use_secure = p_secure;
+    const colyseus_settings_t* settings = p_wrapper->native_client ? p_wrapper->native_client->settings : NULL;
+    if (settings) {
+        options.tls_skip_verification = settings->tls_skip_verification;
+        options.ca_pem_data = settings->ca_pem_data;
+        options.ca_pem_len = settings->ca_pem_len;
+    }
+    return options;
+}
+
+static gobuext_latency_request_t* latency_request(const ColyseusClientWrapper* p_wrapper) {
+    gobuext_latency_request_t* req = (gobuext_latency_request_t*)calloc(1, sizeof(gobuext_latency_request_t));
+    if (req) {
+        req->request_id = ++g_http_request_counter;
+        req->client_id = p_wrapper->object_id;
+    }
+    return req;
+}
+
+// get_latency(endpoint: String, ping_count: int, timeout_ms: int) -> int: the round trip to `endpoint`, or to the
+// client's server when it is "".
+GOBUEXT_METHOD(gobuext_colyseus_client_get_latency) {
+    (void)p_method_userdata; (void)p_argument_count; (void)r_error;
+
+    ColyseusClientWrapper* wrapper = (ColyseusClientWrapper*)p_instance;
+    char* endpoint = wrapper ? gobuext_to_utf8(p_args[0]) : NULL;
+    char* url = endpoint && endpoint[0] ? websocket_url(endpoint) : NULL;
+    gobuext_latency_request_t* req = NULL;
+    if (endpoint && (url || (!endpoint[0] && wrapper->native_client))) {
+        req = latency_request(wrapper);
+    }
+    gobu->variant_new_int(r_return, req ? req->request_id : 0);
+    if (req && url) {
+        colyseus_latency_options_t options = latency_options(wrapper, p_args[1], p_args[2], strncmp(url, "wss://", 6) == 0);
+        colyseus_get_latency(url, &options, on_gobuext_latency, req);
+    } else if (req) {
+        colyseus_latency_options_t options = latency_options(wrapper, p_args[1], p_args[2], false);
+        colyseus_client_get_latency(wrapper->native_client, &options, on_gobuext_latency, req);
+    }
+    free(url);
+    free(endpoint);
+}
+
+// select_by_latency(endpoints: String, ping_count: int, timeout_ms: int) -> int: the endpoint (one per line) of
+// the shortest round trip. They are measured at once.
+GOBUEXT_METHOD(gobuext_colyseus_client_select_by_latency) {
+    (void)p_method_userdata; (void)p_argument_count; (void)r_error;
+
+    ColyseusClientWrapper* wrapper = (ColyseusClientWrapper*)p_instance;
+    char* lines = wrapper ? gobuext_to_utf8(p_args[0]) : NULL;
+    size_t count = 0;
+    char** urls = NULL;
+    if (lines) {
+        size_t capacity = 1;
+        for (const char* c = lines; *c; c++) {
+            capacity += *c == '\n';
+        }
+        urls = (char**)calloc(capacity, sizeof(char*));
+        for (char* line = lines; urls && line;) {
+            char* end = strchr(line, '\n');
+            if (end) {
+                *end = '\0';
+            }
+            if (line[0]) {
+                urls[count++] = websocket_url(line);
+            }
+            line = end ? end + 1 : NULL;
+        }
+    }
+    gobuext_latency_request_t* req = count > 0 ? latency_request(wrapper) : NULL;
+    gobu->variant_new_int(r_return, req ? req->request_id : 0);
+    if (req) {
+        colyseus_latency_options_t options = latency_options(wrapper, p_args[1], p_args[2],
+            urls[0] && strncmp(urls[0], "wss://", 6) == 0);
+        colyseus_select_by_latency((const char* const*)urls, count, &options, on_gobuext_select_by_latency, req);
+    }
+    for (size_t i = 0; i < count; i++) {
+        free(urls[i]);
+    }
+    free(urls);
+    free(lines);
+}
+
+// =============================================================================
 // HTTP event processing — called from poll() on main thread
 // =============================================================================
 
@@ -786,6 +999,49 @@ static void gobuext_room_process_events(void) {
                 emit_signal_of(event->room_id, "reconnected", NULL, 0);
                 break;
 
+            case ROOM_EVENT_PONG: {
+                GobuVariant rtt;
+                gobu->variant_new_int(&rtt, event->code);
+                const GobuVariant* args[1] = { &rtt };
+                emit_signal_of(event->room_id, "pong", args, 1);
+                gobu->variant_destroy(&rtt);
+                break;
+            }
+
+            case ROOM_EVENT_REPLY: {
+                // _request_reply(request_id, outcome, data: Dictionary, reason): a reply that is not an object
+                // goes in data["value"], as an HTTP answer's; none, an empty one.
+                GobuVariant request_id;
+                GobuVariant outcome;
+                GobuVariant data;
+                GobuVariant reason;
+                gobu->variant_new_int(&request_id, event->request_id);
+                gobu->variant_new_int(&outcome, event->code);
+                gobu->dictionary_new(&data);
+                GobuVariant value;
+                if (event->binary_data && event->binary_len > 0
+                        && msgpack_to_gobu_variant(event->binary_data, event->binary_len, &value)) {
+                    if (gobu->variant_get_type(&value) == GOBU_TYPE_DICTIONARY) {
+                        gobu->variant_destroy(&data);
+                        data = value;
+                    } else if (gobu->variant_get_type(&value) != GOBU_TYPE_NIL) {
+                        gobuext_dictionary_set(&data, "value", &value);
+                    } else {
+                        gobu->variant_destroy(&value);
+                    }
+                } else if (event->binary_data && event->binary_len > 0) {
+                    gobu->variant_destroy(&value);
+                }
+                gobuext_new_string(&reason, event->str_data);
+                const GobuVariant* args[4] = { &request_id, &outcome, &data, &reason };
+                emit_signal_of(event->room_id, "_request_reply", args, 4);
+                gobu->variant_destroy(&request_id);
+                gobu->variant_destroy(&outcome);
+                gobu->variant_destroy(&data);
+                gobu->variant_destroy(&reason);
+                break;
+            }
+
             case ROOM_EVENT_MESSAGE: {
                 // Decode msgpack on main thread
                 GobuVariant type;
@@ -816,16 +1072,12 @@ static void gobuext_room_process_events(void) {
     }
 }
 
-// The SDK's network (websocket_transport.c; on the web, its polling of the browser's requests)
-extern void colyseus_http_poll(void);
-extern void colyseus_ws_poll(void);
-
-// Static poll(): runs the network and emits the queued events' signals, on the main thread
+// Static poll(): runs the SDK (its sockets, matchmaking answers, reconnection, latency probes: natively the SDK is
+// polled, plugin.c) and emits the queued events' signals, on the main thread
 GOBUEXT_METHOD(gobuext_colyseus_client_poll) {
     (void)p_method_userdata; (void)p_instance; (void)p_args;
     (void)p_argument_count; (void)r_return; (void)r_error;
-    colyseus_http_poll();
-    colyseus_ws_poll();
+    colyseus_poll();
     gobuext_http_process_events();
     gobuext_room_process_events();
 }

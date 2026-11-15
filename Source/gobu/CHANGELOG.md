@@ -5,6 +5,33 @@ the repository's history.
 
 ## Gobu
 
+### 0.18.4: requests, ping, latency and seat reservations
+- `room.request(type, data, callback, timeout_ms = 10000)`: a message the server answers, with the value its
+  `onMessage(type)` handler returns. `callback(err, data)` as an HTTP request's; `err["code"]` is one of
+  `Colyseus.REQUEST_REJECTED` (`ctx.reject(reason)`, the reason in `err["reason"]`), `REQUEST_FAULTED` (the handler
+  failed, or there is none), `REQUEST_CLOSED` (the connection closed first) and `REQUEST_TIMED_OUT`. Native:
+  `_ColyseusRoom.request(type, data)`, `cancel_request(id)` and the `_request_reply` signal.
+- `room.ping(callback)`: the round trip over the room's connection, `callback(rtt_ms)`; false when not connected.
+  Native: `ping()` and the `pong(rtt_ms)` signal.
+- `client.get_latency(callback, endpoint = "", ping_count = 1, timeout_ms = 1500)` (the client's server, or an
+  address) and `client.select_by_latency(endpoints, callback, ...)` (of several, the nearest), answered as HTTP:
+  `data` is `{ "endpoint", "latency_ms" }`.
+- `client.consume_seat_reservation(reservation)`: joins with a seat the server reserved (`matchMaker.joinOrCreate()`,
+  `reserveSeatFor()`).
+- The SDK runs polled (`colyseus_set_polled()`, as its other engines' bindings): sockets, matchmaking answers,
+  reconnection and latency probes run in `poll()`, on the main thread, so the state is never decoded while the game
+  reads it. `poll()` (and Online's) calls `colyseus_poll()`: on the web, automatic reconnection never retried,
+  because nothing ran `colyseus_reconnect_poll()`.
+- A room the game dropped before it was matched: the answer wrote into the freed room (its data was the
+  matchmaking's userdata), and the connection stayed open. The matchmaking holds the room's id now; a room nobody
+  has leaves at once.
+- A client is freed when the game ends: the HTTP and Auth reply handlers held the client, and the client held them
+  (its signals).
+- Tried with a local Colyseus 0.18 server: the module (HTTP, Auth's error, latency of the server, of a closed port
+  and the selection of the two, ping before and after joining, the six kinds of request, a seat reservation, a
+  dropped room, messages, state, leave) and Online (a host and a game that joins). The web and Android libraries
+  build.
+
 ### 0.18.3: the Colyseus Native SDK 0.18.15
 - `Source/src` and `Source/include` are the SDK's 0.18.15 (it was the copy of 2026-08-21, before its 0.18.0). Its
   fixes: automatic reconnection worked once and `reconnect()` with a token never did; leaving a room while it

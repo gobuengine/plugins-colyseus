@@ -8,9 +8,9 @@
  *
  * The server is Project Settings > Online > Session > Address ("localhost", "wss://example.com") and Port.
  *
- * Natively the client works on its own threads: its callbacks queue events, which poll() hands to the engine
- * on the main thread. A connection that is closed is removed from `live` first, so a late callback finds it
- * gone and does nothing.
+ * The SDK runs polled (plugin.c): its callbacks run in colyseus_poll(), on the main thread, and queue events that
+ * poll() then hands to the engine (matchmaking still waits on its own thread). A connection that is closed is
+ * removed from `live` first, so a late callback finds it gone and does nothing.
  */
 
 #include "gobu_plugin.h"
@@ -374,14 +374,9 @@ static void provider_kick(void *p_connection, int32_t p_peer) {
 	colyseus_room_send_bytes(connection->room, "k", message, 4);
 }
 
-/* The client's own work on the web (its HTTP and WebSocket answers wait to be polled); natively nothing. */
-extern void colyseus_http_poll(void);
-extern void colyseus_ws_poll(void);
-
 static void provider_poll(void *p_connection) {
 	Connection *connection = (Connection *)p_connection;
-	colyseus_http_poll();
-	colyseus_ws_poll();
+	colyseus_poll();
 	MUTEX_LOCK(&live_mutex);
 	Event *event = connection->head;
 	connection->head = NULL;

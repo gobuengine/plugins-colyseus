@@ -55,6 +55,16 @@ ARRAY :: "array"
 ## Reference to another schema
 REF :: "ref"
 
+## How a `room.request()` failed: the `code` of its `err`.
+## The room's handler rejected it (`err["reason"]` is what it gave).
+REQUEST_REJECTED :: 1
+## The room's handler failed, or the room has none for that type.
+REQUEST_FAULTED :: 2
+## The connection closed before the reply.
+REQUEST_CLOSED :: 3
+## No reply in time.
+REQUEST_TIMED_OUT :: 4
+
 ## Auth operations (the op of the native auth_request()); the order is the ABI.
 _AUTH_GET_USER_DATA :: 0
 _AUTH_REGISTER :: 1
@@ -166,23 +176,20 @@ static fn is_collection_type(type_str: String) bool {
 }
 
 # =============================================================================
-# Reply routing (HTTP + Auth)
+# Reply routing (HTTP, Auth, latency and room requests)
 # =============================================================================
 ##
-## Callback-based requests answer through the native `_http_response` /
-## `_http_error` signals. Both HTTP and Auth share ONE reply table per client:
-## both dispatch through the same native queue and draw their request ids from
-## the same counter, so a second router would receive (and have to ignore) the
-## other's replies. The table (request_id -> Callable) lives here, one per client
-## (by its native object's id): a Dictionary is a value in Grost, so the Client,
-## HTTP and Auth structs each holding one would each have their own copy.
+## Callback-based requests answer through native signals: a client's `_http_response` / `_http_error` (HTTP,
+## Auth and latency share its request ids), a room's `_request_reply`. The table (request_id -> Callable) lives
+## here, one per native object (by its instance id): a Dictionary is a value in Grost, so the Client, HTTP and
+## Auth structs each holding one would each have their own copy.
 static mut _replies : Dictionary[int, Dictionary] = {}
 
-## Remembers `callback` for `request_id`, and hands the id straight back so a
-## dispatch reads as one line.
-static fn _replies_track(native: _ColyseusClient, request_id: int, callback: Callable) int {
-	if native != null and request_id != 0 and callback.is_valid() {
-		key := native.get_instance_id()
+## Remembers `callback` for `request_id` of `owner` (a native client or room), and hands the id straight back so
+## a dispatch reads as one line.
+static fn _replies_track(owner: Object, request_id: int, callback: Callable) int {
+	if owner != null and request_id != 0 and callback.is_valid() {
+		key := owner.get_instance_id()
 		if not _replies.has(key) {
 			_replies[key] = {}
 		}
@@ -191,15 +198,18 @@ static fn _replies_track(native: _ColyseusClient, request_id: int, callback: Cal
 	return request_id
 }
 
-## `client_id`: the native client's instance id (the answers' handlers hold the id, not the client: holding it
-## from its own signals, the client would never be freed).
-static fn _replies_take(client_id: int, request_id: int) Callable {
-	key := client_id
+## `owner_id`: the native client's or room's instance id (the answers' handlers hold the id, not the object:
+## holding it from its own signals, the object would never be freed).
+static fn _replies_take(owner_id: int, request_id: int) Callable {
+	key := owner_id
 	if not _replies.has(key) or not _replies[key].has(request_id) {
 		return Callable()
 	}
 	callback : Callable = (_replies[key][request_id] as Callable) ?? Callable()
 	_ = _replies[key].erase(request_id)
+	if _replies[key].is_empty() {
+		_ = _replies.erase(key)
+	}
 	return callback
 }
 
@@ -224,6 +234,38 @@ static fn _on_http_error(client_id: int, request_id: int, code: int, message: St
 	if callback.is_valid() {
 		callback.call({ "code": code, "message": message }, {})
 	}
+}
+
+## A room request's reply (`outcome` 0, or a REQUEST_* code): `data` is the reply, or the reason of a rejection or
+## a failure.
+static fn _on_request_reply(room_id: int, request_id: int, outcome: int, data: Dictionary, reason: String) void {
+	callback := _replies_take(room_id, request_id)
+	if not callback.is_valid() {
+		return
+	}
+	if outcome == 0 {
+		callback.call({}, data)
+		return
+	}
+	mut message := reason
+	if outcome == REQUEST_REJECTED {
+		message = str(data["value"]) if data.has("value") else JSON.stringify(data)
+	} elif outcome == REQUEST_FAULTED {
+		message = str(data.get("message", "The room's handler failed."))
+	}
+	callback.call({ "code": outcome, "message": message, "reason": data }, {})
+}
+
+static fn _on_request_timeout(room_id: int, request_id: int) void {
+	callback := _replies_take(room_id, request_id)
+	if not callback.is_valid() {
+		return
+	}
+	native := instance_from_id(room_id) as _ColyseusRoom
+	if native != null {
+		native.cancel_request(request_id)
+	}
+	callback.call({ "code": REQUEST_TIMED_OUT, "message": "No reply in time." }, {})
 }
 
 # =============================================================================
@@ -304,13 +346,19 @@ impl Callbacks {
 ## Wraps the native ColyseusRoom. Signals are exposed on `room.native`
 ## (`joined`, `state_changed`, `message_received(type, data)`,
 ## `error(code, message)`, `left(code, reason)`, `dropped(code, reason)`,
-## `reconnected`), or through the `on_*` helpers below.
+## `reconnected`, `pong(rtt_ms)`), or through the `on_*` helpers below.
 Room :: struct {
 	native : _ColyseusRoom = null
 }
 
 impl Room {
 	fn new(native_room: _ColyseusRoom) Room {
+		if native_room != null {
+			# The replies of request() go by the room's id (see _replies_take()).
+			room_id : int = native_room.get_instance_id()
+			mut on_reply := fn(request_id: int, outcome: int, data: Dictionary, reason: String) { _on_request_reply(room_id, request_id, outcome, data, reason) }
+			native_room._request_reply.connect(on_reply)
+		}
 		return Room{ .native = native_room }
 	}
 
@@ -371,6 +419,41 @@ impl Room {
 		} else {
 			self.native.send_message_int(type, data)
 		}
+	}
+
+	## Send a message and wait for the server's reply, the value its `onMessage(type)` handler returns:
+	## `callback(err: Dictionary, data: Dictionary)`, as an HTTP request answers (a reply that isn't an object in
+	## `data["value"]`). `err` is empty when it went well, else `{ "code": int, "message": String, "reason":
+	## Dictionary }` with a REQUEST_* code. Without a reply in `timeout_ms` (0: no limit) it fails with
+	## REQUEST_TIMED_OUT. Returns the request's id, 0 when it could not be sent.
+	fn request(self, type: String, data: Dictionary, callback: Callable, timeout_ms: int = 10000) int {
+		if self.native == null {
+			return 0
+		}
+		mut request_id : int = 0
+		if data.is_empty() {
+			request_id = self.native.request(type, null)
+		} else {
+			request_id = self.native.request(type, data)
+		}
+		_ = _replies_track(self.native, request_id, callback)
+		mut tree := Engine.get_main_loop() as SceneTree
+		if request_id != 0 and timeout_ms > 0 and tree != null {
+			room_id : int = self.native.get_instance_id()
+			mut on_timeout := fn() { _on_request_timeout(room_id, request_id) }
+			tree.create_timer(timeout_ms / 1000.0).timeout.connect(on_timeout)
+		}
+		return request_id
+	}
+
+	## Measure the round trip to the room over its connection: `callback(rtt_ms: int)`. Returns false (and
+	## `callback` never runs) when the room isn't connected. A new ping replaces one still waiting.
+	fn ping(self, callback: Callable) bool {
+		if self.native == null or not self.native.ping() {
+			return false
+		}
+		self.native.pong.connect(callback, CONNECT_ONE_SHOT)
+		return true
 	}
 
 	fn leave(self) void {
@@ -630,5 +713,24 @@ impl Client {
 	## Re-take a seat using the token from [method Room.get_reconnection_token]
 	fn reconnect(self, reconnection_token: String) Room {
 		return Room.new(self.native.reconnect(reconnection_token) as _ColyseusRoom)
+	}
+
+	## Join with a seat the server reserved for this player (`matchMaker.joinOrCreate()`, `reserveSeatFor()`):
+	## the reservation it sent, as it came.
+	fn consume_seat_reservation(self, reservation: Dictionary) Room {
+		return Room.new(self.native.consume_seat_reservation(JSON.stringify(reservation)) as _ColyseusRoom)
+	}
+
+	## The round trip to the server (or to `endpoint`, a "ws://" or "wss://" address), the average of
+	## `ping_count` pings: `callback(err: Dictionary, data: Dictionary)` with `data` `{ "endpoint": String,
+	## "latency_ms": float }`. It fails after `timeout_ms`.
+	fn get_latency(self, callback: Callable, endpoint: String = "", ping_count: int = 1, timeout_ms: int = 1500) int {
+		return _replies_track(self.native, self.native.get_latency(endpoint, ping_count, timeout_ms), callback)
+	}
+
+	## Of `endpoints` ("ws://" or "wss://" addresses), the one of the shortest round trip, all measured at once:
+	## `callback(err: Dictionary, data: Dictionary)` as `get_latency()`'s. It fails when none answers.
+	fn select_by_latency(self, endpoints: []String, callback: Callable, ping_count: int = 1, timeout_ms: int = 1500) int {
+		return _replies_track(self.native, self.native.select_by_latency("\n".join(endpoints), ping_count, timeout_ms), callback)
 	}
 }

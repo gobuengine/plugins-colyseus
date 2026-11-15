@@ -48,13 +48,23 @@ typedef struct ColyseusClientWrapper {
 // A schema definition of Colyseus.schema() (colyseus_schema_definition.h)
 typedef struct colyseus_schema_definition colyseus_schema_definition_t;
 
+// A request() of a room waiting for its reply (colyseus_room.c)
+typedef struct gobuext_room_request gobuext_room_request_t;
+
 // The data of a _ColyseusRoom
 typedef struct {
     colyseus_room_t* native_room;
     GobuObjectId object_id;              // The engine object: its events resolve it on the main thread
     const colyseus_schema_vtable_t* pending_vtable;  // Vtable to set when native room is assigned
     colyseus_schema_definition_t* schema_definition;  // The one of set_state_type(), if any
+    gobuext_room_request_t* requests;    // Its request()s without a reply yet
 } ColyseusRoomWrapper;
+
+// Room events of colyseus_room.c, queued for poll() (colyseus_client.c): a request()'s reply (`p_data` is its
+// msgpack, `p_reason` the close reason when the connection went first) and a ping()'s round trip.
+void gobuext_room_queue_reply(GobuObjectId p_room_id, uint32_t p_request_id, int p_outcome, const uint8_t* p_data,
+    size_t p_length, const char* p_reason);
+void gobuext_room_queue_pong(GobuObjectId p_room_id, int p_rtt_ms);
 
 // _ColyseusClient
 void* gobuext_colyseus_client_create_instance(void* p_class_userdata, GobuObject* p_object);
@@ -67,6 +77,11 @@ GOBUEXT_METHOD(gobuext_colyseus_client_create);
 GOBUEXT_METHOD(gobuext_colyseus_client_join);
 GOBUEXT_METHOD(gobuext_colyseus_client_join_by_id);
 GOBUEXT_METHOD(gobuext_colyseus_client_reconnect);
+// consume_seat_reservation(reservation_json): a seat the server reserved (matchMaker.joinOrCreate()...)
+GOBUEXT_METHOD(gobuext_colyseus_client_consume_seat_reservation);
+// Latency: (endpoint or endpoints, ping_count, timeout_ms) -> request id, answered as an HTTP request
+GOBUEXT_METHOD(gobuext_colyseus_client_get_latency);
+GOBUEXT_METHOD(gobuext_colyseus_client_select_by_latency);
 // HTTP: (path[, body]) -> request id, answered by the _http_response / _http_error signals
 GOBUEXT_METHOD(gobuext_colyseus_client_http_get);
 GOBUEXT_METHOD(gobuext_colyseus_client_http_post);
@@ -89,6 +104,11 @@ ColyseusRoomWrapper* gobuext_colyseus_room_get_wrapper(GobuObject* p_object);
 GOBUEXT_METHOD(gobuext_colyseus_room_send_message);
 GOBUEXT_METHOD(gobuext_colyseus_room_send_message_int);
 GOBUEXT_METHOD(gobuext_colyseus_room_leave);
+// request(type, data) -> request id, answered by _request_reply; cancel_request(id)
+GOBUEXT_METHOD(gobuext_colyseus_room_request);
+GOBUEXT_METHOD(gobuext_colyseus_room_cancel_request);
+// ping() -> bool, answered by pong(rtt_ms)
+GOBUEXT_METHOD(gobuext_colyseus_room_ping);
 GOBUEXT_METHOD(gobuext_colyseus_room_get_id);
 GOBUEXT_METHOD(gobuext_colyseus_room_get_session_id);
 GOBUEXT_METHOD(gobuext_colyseus_room_get_reconnection_token);
