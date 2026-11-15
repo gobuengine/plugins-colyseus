@@ -1074,12 +1074,17 @@ static void gobuext_room_process_events(void) {
 
 // Static poll(): runs the SDK (its sockets, matchmaking answers, reconnection, latency probes: natively the SDK is
 // polled, plugin.c) and emits the queued events' signals, on the main thread
+void gobuext_colyseus_poll_all(void) {
+    colyseus_poll();
+    gobuext_room_requests_expire();
+    gobuext_http_process_events();
+    gobuext_room_process_events();
+}
+
 GOBUEXT_METHOD(gobuext_colyseus_client_poll) {
     (void)p_method_userdata; (void)p_instance; (void)p_args;
     (void)p_argument_count; (void)r_return; (void)r_error;
-    colyseus_poll();
-    gobuext_http_process_events();
-    gobuext_room_process_events();
+    gobuext_colyseus_poll_all();
 }
 
 // =============================================================================

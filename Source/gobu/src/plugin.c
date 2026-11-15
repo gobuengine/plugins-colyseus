@@ -135,9 +135,9 @@ static void register_colyseus_room(void) {
     add_method(cls, "send_message", gobuext_colyseus_room_send_message, 0, NO_RETURN, send, 2);
     add_method(cls, "send_message_int", gobuext_colyseus_room_send_message_int, 0, NO_RETURN, send_int, 2);
     add_method(cls, "leave", gobuext_colyseus_room_leave, 0, NO_RETURN, NULL, 0);
-    const GobuArgInfo request[] = { ARG("type", STRING), ANY("data") };
+    const GobuArgInfo request[] = { ARG("type", STRING), ANY("data"), ARG("timeout_ms", INT) };
     const GobuArgInfo request_id[] = { ARG("request_id", INT) };
-    add_method(cls, "request", gobuext_colyseus_room_request, 0, GOBU_TYPE_INT, request, 2);
+    add_method(cls, "request", gobuext_colyseus_room_request, 0, GOBU_TYPE_INT, request, ARG_COUNT(request));
     add_method(cls, "cancel_request", gobuext_colyseus_room_cancel_request, 0, NO_RETURN, request_id, 1);
     add_method(cls, "ping", gobuext_colyseus_room_ping, 0, GOBU_TYPE_BOOL, NULL, 0);
 
@@ -180,6 +180,13 @@ static void register_colyseus_callbacks(void) {
 
 bool colyseus_register_online_provider(const GobuPluginApi *p_api, GobuPluginHandle p_plugin);
 
+// Every frame, on the main thread: the network, the requests' timeouts and the events' signals.
+static void colyseus_process(void *userdata, double delta) {
+    (void)userdata;
+    (void)delta;
+    gobuext_colyseus_poll_all();
+}
+
 static void colyseus_plugin_deinitialize(void *userdata) {
     (void)userdata;
     gobuext_tls_certificates_cleanup();
@@ -206,6 +213,7 @@ GOBU_PLUGIN_EXPORT bool gobu_plugin_init(const GobuPluginApi *p_api, GobuPluginH
     register_colyseus_client();
     register_colyseus_room();
     register_colyseus_callbacks();
+    gobu->add_process_callback(gobu_plugin, colyseus_process, NULL);
     if (!colyseus_register_online_provider(p_api, p_plugin)) {
         return false;
     }

@@ -76,30 +76,10 @@ _AUTH_SEND_PASSWORD_RESET :: 4
 # Polling
 # =============================================================================
 
-## Internal: whether a client exists (poll() only works then).
-static mut _has_client := false
-## Internal: whether `poll()` is already wired to the scene tree's frame signal.
-static mut _poll_connected := false
-
-## Poll the native SDK for network events. Called automatically each frame
-## once a client exists. Only call manually for headless/test usage.
+## Runs the network and hands out its events. The plugin does it every frame by itself: call it only to see an
+## answer sooner, in the middle of a frame.
 static fn poll() void {
-	if _has_client {
-		_ColyseusClient.poll()
-	}
-}
-
-static fn _ensure_polling() void {
-	if _poll_connected {
-		return
-	}
-	mut tree := Engine.get_main_loop() as SceneTree
-	if tree == null {
-		return
-	}
-	mut on_frame := fn() { poll() }
-	tree.process_frame.connect(on_frame)
-	_poll_connected = true
+	_ColyseusClient.poll()
 }
 
 ## @deprecated: Use Colyseus.Client.new("ws://localhost:2567") instead.
@@ -256,17 +236,6 @@ static fn _on_request_reply(room_id: int, request_id: int, outcome: int, data: D
 	callback.call({ "code": outcome, "message": message, "reason": data }, {})
 }
 
-static fn _on_request_timeout(room_id: int, request_id: int) void {
-	callback := _replies_take(room_id, request_id)
-	if not callback.is_valid() {
-		return
-	}
-	native := instance_from_id(room_id) as _ColyseusRoom
-	if native != null {
-		native.cancel_request(request_id)
-	}
-	callback.call({ "code": REQUEST_TIMED_OUT, "message": "No reply in time." }, {})
-}
 
 # =============================================================================
 # Callbacks
@@ -431,19 +400,13 @@ impl Room {
 			return 0
 		}
 		mut request_id : int = 0
+		# The plugin answers it as REQUEST_TIMED_OUT when timeout_ms passes without a reply.
 		if data.is_empty() {
-			request_id = self.native.request(type, null)
+			request_id = self.native.request(type, null, timeout_ms)
 		} else {
-			request_id = self.native.request(type, data)
+			request_id = self.native.request(type, data, timeout_ms)
 		}
-		_ = _replies_track(self.native, request_id, callback)
-		mut tree := Engine.get_main_loop() as SceneTree
-		if request_id != 0 and timeout_ms > 0 and tree != null {
-			room_id : int = self.native.get_instance_id()
-			mut on_timeout := fn() { _on_request_timeout(room_id, request_id) }
-			tree.create_timer(timeout_ms / 1000.0).timeout.connect(on_timeout)
-		}
-		return request_id
+		return _replies_track(self.native, request_id, callback)
 	}
 
 	## Measure the round trip to the room over its connection: `callback(rtt_ms: int)`. Returns false (and
@@ -671,8 +634,6 @@ impl Client {
 		if endpoint != "" {
 			client.native.set_endpoint(endpoint)
 		}
-		_has_client = true
-		_ensure_polling()
 		return client
 	}
 

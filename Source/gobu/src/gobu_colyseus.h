@@ -65,6 +65,11 @@ typedef struct {
 void gobuext_room_queue_reply(GobuObjectId p_room_id, uint32_t p_request_id, int p_outcome, const uint8_t* p_data,
     size_t p_length, const char* p_reason);
 void gobuext_room_queue_pong(GobuObjectId p_room_id, int p_rtt_ms);
+// A request() without a reply in its time: answered as REQUEST_TIMED_OUT (4), on the main thread (poll()).
+void gobuext_room_requests_expire(void);
+
+// Runs the SDK and emits the queued events: every frame (plugin.c's process callback), or poll().
+void gobuext_colyseus_poll_all(void);
 
 // _ColyseusClient
 void* gobuext_colyseus_client_create_instance(void* p_class_userdata, GobuObject* p_object);
@@ -104,7 +109,7 @@ ColyseusRoomWrapper* gobuext_colyseus_room_get_wrapper(GobuObject* p_object);
 GOBUEXT_METHOD(gobuext_colyseus_room_send_message);
 GOBUEXT_METHOD(gobuext_colyseus_room_send_message_int);
 GOBUEXT_METHOD(gobuext_colyseus_room_leave);
-// request(type, data) -> request id, answered by _request_reply; cancel_request(id)
+// request(type, data, timeout_ms) -> request id, answered by _request_reply; cancel_request(id)
 GOBUEXT_METHOD(gobuext_colyseus_room_request);
 GOBUEXT_METHOD(gobuext_colyseus_room_cancel_request);
 // ping() -> bool, answered by pong(rtt_ms)

@@ -65,11 +65,12 @@ What `colyseus.gro` wraps; a game uses the Grost module `Colyseus`.
 `_ColyseusRoom` at once, which joins later. `http_get(path)`, `http_post(path, body)`, `http_put`,
 `http_delete`, `http_patch` and `auth_request(op, email, password, options_json)` return a request id, answered
 by the signals `_http_response(request_id, status_code, body)` and `_http_error(request_id, code, message)`.
-`auth_set_token(token)`, `auth_get_token()`, `auth_signout()`. Static `poll()`: runs the network and emits
-the signals, on the main thread (`colyseus.gro` calls it every frame).
+`auth_set_token(token)`, `auth_get_token()`, `auth_signout()`. Static `poll()`: runs the network, expires
+requests and emits the signals, on the main thread (the plugin does it every frame by itself).
 
 `_ColyseusRoom`: `send_message(type: String, data)`, `send_message_int(type: int, data)` (`data`: any value,
-sent as msgpack), `leave()`, `get_id()`, `get_session_id()`, `get_reconnection_token()`, `get_name()`,
+sent as msgpack), `request(type, data, timeout_ms)` (an id answered by `_request_reply`; 0 ms: no limit),
+`cancel_request(id)`, `ping()` (the `pong(rtt_ms)` signal), `leave()`, `get_id()`, `get_session_id()`, `get_reconnection_token()`, `get_name()`,
 `is_connected()`, `is_reconnecting()`, `set_reconnection_options(options: Dictionary)`, `get_state()` (a
 Dictionary) and `set_state_type(type)` (a schema of `Colyseus.schema()`). Signals: `joined()`,
 `state_changed()`, `reconnected()`, `message_received(type, data)`, `error(code, message)`,

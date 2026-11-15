@@ -6,26 +6,65 @@
 #include <colyseus/room.h>
 #include <colyseus/schema.h>
 #include <colyseus/schema/dynamic_schema.h>
+#include <colyseus/utils/time.h>
 #include <stdlib.h>
 #include <string.h>
 
 // A request() waiting for its reply. The SDK's reply callback does not say which request it answers: this does.
+// One with a deadline is also in the list every room's expiring requests share.
 struct gobuext_room_request {
     ColyseusRoomWrapper* wrapper;
     uint32_t id;
+    uint64_t deadline_ms;  // 0: it waits as long as it takes
     struct gobuext_room_request* next;
+    struct gobuext_room_request* expiring_next;
 };
 
-// Takes the request of `p_id` out of the room's list; NULL if it has none.
+static gobuext_room_request_t* g_expiring = NULL;
+
+static void expiring_remove(gobuext_room_request_t* p_request) {
+    for (gobuext_room_request_t** link = &g_expiring; *link; link = &(*link)->expiring_next) {
+        if (*link == p_request) {
+            *link = p_request->expiring_next;
+            return;
+        }
+    }
+}
+
+// Takes the request of `p_id` out of the room's list (and the expiring one); NULL if it has none.
 static gobuext_room_request_t* room_request_take(ColyseusRoomWrapper* p_wrapper, uint32_t p_id) {
     for (gobuext_room_request_t** link = &p_wrapper->requests; *link; link = &(*link)->next) {
         if ((*link)->id == p_id) {
             gobuext_room_request_t* request = *link;
             *link = request->next;
+            if (request->deadline_ms != 0) {
+                expiring_remove(request);
+            }
             return request;
         }
     }
     return NULL;
+}
+
+void gobuext_room_requests_expire(void) {
+    const uint64_t now = colyseus_monotonic_ms();
+    gobuext_room_request_t** link = &g_expiring;
+    while (*link) {
+        gobuext_room_request_t* request = *link;
+        if (now < request->deadline_ms) {
+            link = &request->expiring_next;
+            continue;
+        }
+        *link = request->expiring_next;
+        request->deadline_ms = 0;  // Out of the expiring list already.
+        ColyseusRoomWrapper* wrapper = request->wrapper;
+        const uint32_t id = request->id;
+        free(room_request_take(wrapper, id));
+        if (wrapper->native_room) {
+            colyseus_room_cancel_request(wrapper->native_room, id);
+        }
+        gobuext_room_queue_reply(wrapper->object_id, id, 4, NULL, 0, "No reply in time.");
+    }
 }
 
 void* gobuext_colyseus_room_create_instance(void* p_class_userdata, GobuObject* p_object) {
@@ -47,6 +86,9 @@ void gobuext_colyseus_room_free_instance(void* p_class_userdata, void* p_instanc
         }
         while (wrapper->requests) {
             gobuext_room_request_t* next = wrapper->requests->next;
+            if (wrapper->requests->deadline_ms != 0) {
+                expiring_remove(wrapper->requests);
+            }
             free(wrapper->requests);
             wrapper->requests = next;
         }
@@ -104,6 +146,16 @@ GOBUEXT_METHOD(gobuext_colyseus_room_send_message_int) {
     free(msgpack_data);
 }
 
+// The request of `p_id` still waiting in the room's list, or NULL (it was answered during the call).
+static gobuext_room_request_t* room_request_find(ColyseusRoomWrapper* p_wrapper, uint32_t p_id) {
+    for (gobuext_room_request_t* request = p_wrapper->requests; request; request = request->next) {
+        if (request->id == p_id) {
+            return request;
+        }
+    }
+    return NULL;
+}
+
 static void on_request_reply(colyseus_request_outcome_t p_outcome, const uint8_t* p_data, size_t p_length,
     const char* p_reason, void* p_userdata) {
     gobuext_room_request_t* request = (gobuext_room_request_t*)p_userdata;
@@ -112,8 +164,9 @@ static void on_request_reply(colyseus_request_outcome_t p_outcome, const uint8_t
     free(room_request_take(wrapper, request->id));
 }
 
-// request(type: String, data) -> int: the request's id (0 when it was not sent), answered by _request_reply. `data`
-// goes as msgpack, as send_message()'s; the reply is what the server's onMessage handler returns.
+// request(type: String, data, timeout_ms: int) -> int: the request's id (0 when it was not sent), answered by
+// _request_reply. `data` goes as msgpack, as send_message()'s; the reply is what the server's onMessage handler
+// returns. Without one in timeout_ms (0: no limit), it is answered as timed out.
 GOBUEXT_METHOD(gobuext_colyseus_room_request) {
     (void)p_method_userdata; (void)p_argument_count; (void)r_error;
 
@@ -135,8 +188,13 @@ GOBUEXT_METHOD(gobuext_colyseus_room_request) {
     size_t length = 0;
     uint8_t* data = gobu_variant_to_msgpack(p_args[1], &length);
     const uint32_t id = colyseus_room_request_encoded_reply(wrapper->native_room, type, data, length, on_request_reply, request);
+    const int64_t timeout_ms = gobu->variant_to_int(p_args[2]);
     if (id == 0) {
         free(room_request_take(wrapper, next_id));  // Not sent: no reply will come.
+    } else if (timeout_ms > 0 && room_request_find(wrapper, next_id)) {
+        request->deadline_ms = colyseus_monotonic_ms() + (uint64_t)timeout_ms;
+        request->expiring_next = g_expiring;
+        g_expiring = request;
     }
     gobu->variant_destroy(r_return);
     gobu->variant_new_int(r_return, id);

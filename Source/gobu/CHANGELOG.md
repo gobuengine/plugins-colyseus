@@ -5,6 +5,17 @@ the repository's history.
 
 ## Gobu
 
+### 0.18.5: the network runs from C, without the scene tree
+- The plugin runs the SDK every frame by itself (`add_process_callback()` of the plugin API): `poll()` no longer
+  connects to the tree's `process_frame`, and calling it is only for an answer sooner, in the middle of a frame.
+  Grost code can't use the `SceneTree` any more, and the module doesn't.
+- `request()`'s `timeout_ms` is kept in C: a request without a reply in time is answered as `REQUEST_TIMED_OUT`
+  from the same frame callback, and the SDK forgets it. Native: `_ColyseusRoom.request(type, data, timeout_ms)`
+  (0: no limit). Before, the module armed a tree timer per request.
+- Tried with a local Colyseus 0.18 server: the module (the six kinds of request, a slow one answered as timed out
+  from C, ping, latency, a dropped room, messages, state, leave) and Online (a host and a game that joins), with no
+  leaks. The six libraries build.
+
 ### 0.18.4: requests, ping, latency and seat reservations
 - `room.request(type, data, callback, timeout_ms = 10000)`: a message the server answers, with the value its
   `onMessage(type)` handler returns. `callback(err, data)` as an HTTP request's; `err["code"]` is one of
