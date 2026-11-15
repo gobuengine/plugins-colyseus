@@ -5,6 +5,14 @@ the repository's history.
 
 ## Gobu
 
+### 0.18.6: no JavaScript errors on the web
+- A socket destroyed while it still closed (a latency probe, a dropped room, the client freed) got its `onclose` or
+  `onerror` after its entry was gone: `Uncaught TypeError: Cannot set properties of undefined (setting 'closed')`
+  in the console. Its handlers now drop late events, and destroying one unhooks them before closing it
+  (`src/network/websocket_transport_web.c`, the SDK's side-module transport; its script buffer grew to fit).
+- Tried on the web (release, no threads, Edge headless) with a local Colyseus 0.18 server: the same answers as
+  before, with no errors in the console.
+
 ### 0.18.5: the network runs from C, without the scene tree
 - The plugin runs the SDK every frame by itself (`add_process_callback()` of the plugin API): `poll()` no longer
   connects to the tree's `process_frame`, and calling it is only for an answer sooner, in the middle of a frame.

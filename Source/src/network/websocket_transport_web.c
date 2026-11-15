@@ -253,20 +253,21 @@ static void web_ws_connect_impl(colyseus_transport_t* transport, const char* url
         "  try {"
         "    var ws = new WebSocket(url);"
         "    ws.binaryType = \"arraybuffer\";"
+        /* Gobu: a socket destroyed while it closes has no events[] entry left: its late events are dropped. */
+        "    var ev = function() { return Module._colyseusWs.events[socketId]; };"
         "    ws.onopen = function() {"
-        "      Module._colyseusWs.events[socketId].open = true;"
+        "      if (ev()) ev().open = true;"
         "    };"
         "    ws.onmessage = function(e) {"
-        "      if (e.data instanceof ArrayBuffer) {"
-        "        Module._colyseusWs.events[socketId].messages.push(new Uint8Array(e.data));"
+        "      if (ev() && e.data instanceof ArrayBuffer) {"
+        "        ev().messages.push(new Uint8Array(e.data));"
         "      }"
         "    };"
         "    ws.onerror = function() {"
-        "      Module._colyseusWs.events[socketId].error = true;"
+        "      if (ev()) ev().error = true;"
         "    };"
         "    ws.onclose = function(e) {"
-        "      Module._colyseusWs.events[socketId].closed = true;"
-        "      Module._colyseusWs.events[socketId].closeCode = e.code;"
+        "      if (ev()) { ev().closed = true; ev().closeCode = e.code; }"
         "    };"
         "    Module._colyseusWs.sockets[socketId] = ws;"
         "    return socketId;"
@@ -368,11 +369,12 @@ static void web_ws_destroy_impl(colyseus_transport_t* transport) {
     colyseus_web_transport_data_t* data = (colyseus_web_transport_data_t*)transport->impl_data;
     if (data) {
         if (data->socket_id >= 0) {
-            char script[256];
+            char script[512];
             snprintf(script, sizeof(script),
                 "(function() {"
                 "  var ws = Module._colyseusWs.sockets[%d];"
                 "  if (ws) {"
+                "    ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;"
                 "    ws.close(1000, \"\");"
                 "    delete Module._colyseusWs.sockets[%d];"
                 "    delete Module._colyseusWs.events[%d];"
