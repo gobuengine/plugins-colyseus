@@ -98,6 +98,7 @@ static void native_value_to_variant(void* value, int field_type, const colyseus_
         case COLYSEUS_FIELD_UINT32: gobu->variant_new_int(out_variant, *(uint32_t*)value); break;
         case COLYSEUS_FIELD_UINT64: gobu->variant_new_int(out_variant, (int64_t)*(uint64_t*)value); break;
         case COLYSEUS_FIELD_FLOAT32: gobu->variant_new_float(out_variant, *(float*)value); break;
+        case COLYSEUS_FIELD_NUMBER: // A "number" is a double, as float64 (the decoder's).
         case COLYSEUS_FIELD_FLOAT64: gobu->variant_new_float(out_variant, *(double*)value); break;
         case COLYSEUS_FIELD_BOOLEAN: gobu->variant_new_bool(out_variant, *(bool*)value); break;
         case COLYSEUS_FIELD_REF: {

@@ -24,8 +24,10 @@ the repository's history.
   `room.input()/predict()/clock()/set_latency()/net_pump()/drop()`): they called native methods this binding
   never had. Also `get_default_value()`, which had no single type.
 - Tried against a local server with a room of its own: HTTP (a reply and a 404), Auth's error, join, messages by
-  name and by number, the state, `on_add`, leave. Known: `listen()` on a `number` field gives null values: the
-  binding's `native_value_to_variant` has no case for `COLYSEUS_FIELD_NUMBER` (it needs the libraries rebuilt).
+  name and by number, the state, `on_add`, leave.
+- `listen()` on a `number` field (the schemas' usual number) gave null values: `native_value_to_variant` had no
+  case for `COLYSEUS_FIELD_NUMBER`, which the decoder keeps as a double, as `float64`. The libraries are rebuilt
+  with Zig 0.15.2 (Windows, web, Android).
 
 ### Plugins window
 - `icon.svg` (a colosseum) and `"icon"` in `plugin.json`: its image in Gobu's Edit > Plugins, which installs it
