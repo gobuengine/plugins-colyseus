@@ -1,5 +1,5 @@
 module Colyseus
-## Colyseus SDK for Gobu (0.18.0): the client of the plugin's native classes (_ColyseusClient,
+## Colyseus SDK for Gobu (0.18.15): the client of the plugin's native classes (_ColyseusClient,
 ## _ColyseusRoom, _ColyseusCallbacks), on Windows and the web (Gobu's web templates without threads).
 ##
 ## Every wrapper is a `struct` with an `impl` block. Structs are values: keep them in `mut` variables and

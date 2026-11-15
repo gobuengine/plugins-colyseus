@@ -1,4 +1,4 @@
-#include "colyseus/websocket_transport.h"
+#include "websocket_transport_internal.h"
 #include "colyseus/utils/strUtil.h"
 #include "sds.h"
 #include <wslay/wslay.h>
@@ -6,7 +6,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
-#include "../../include/colyseus/tls_context.h"
+#include "tls_context.h"
 #include "colyseus/settings.h"
 #include "certs/system_certs.h"
 #include "certs/ca_bundle.h"
@@ -32,6 +32,121 @@
     typedef void* thread_return_t;
     #define THREAD_CALL
 #endif
+
+#ifdef _WIN32
+    #define ws_lock_init(l)    InitializeCriticalSection(l)
+    #define ws_lock_destroy(l) DeleteCriticalSection(l)
+    #define ws_lock(l)         EnterCriticalSection(l)
+    #define ws_unlock(l)       LeaveCriticalSection(l)
+#else
+    #define ws_lock_init(l)    pthread_mutex_init((l), NULL)
+    #define ws_lock_destroy(l) pthread_mutex_destroy(l)
+    #define ws_lock(l)         pthread_mutex_lock(l)
+    #define ws_unlock(l)       pthread_mutex_unlock(l)
+#endif
+
+/* The transport whose tick loop runs on this thread. A close has to know
+ * whether IT is the tick thread (joining yourself deadlocks), and "a tick
+ * thread exists" is not the same question. */
+static _Thread_local const colyseus_ws_transport_data_t* ws_current_tick = NULL;
+
+/* Polled mode (colyseus_ws_set_polled): no tick thread — colyseus_ws_poll()
+ * ticks every polled transport on the caller's thread. The mode is read once
+ * per transport, at connect, so flipping it later never strands a live one.
+ *
+ * The list is locked because connect/close/destroy may come from other
+ * threads (the reconnect worker). `g_ws_ticking` is the transport a poll — or
+ * an inline flush — is inside right now: a close from another thread waits it
+ * out, the polled equivalent of joining the tick thread. Slots are nulled,
+ * never compacted, so a poll can walk the list by index while a callback
+ * connects another. */
+static int g_ws_polled_default = 0;
+static colyseus_transport_t** g_ws_polled_list = NULL;
+static int g_ws_polled_cap = 0;
+static const colyseus_transport_t* g_ws_ticking = NULL;
+
+/* The thread that last ran colyseus_ws_poll(), as the address of one of its
+ * thread-locals (unique per live thread). Only it may flush a send inline. */
+static _Thread_local char ws_thread_token;
+static const void* g_ws_poll_thread = NULL;
+
+#define WS_MODE_DEFAULT  0
+#define WS_MODE_THREADED 1
+#define WS_MODE_POLLED   2
+#ifdef _WIN32
+static SRWLOCK g_ws_polled_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE g_ws_polled_cond = CONDITION_VARIABLE_INIT;
+    #define ws_polled_lock()   AcquireSRWLockExclusive(&g_ws_polled_lock)
+    #define ws_polled_unlock() ReleaseSRWLockExclusive(&g_ws_polled_lock)
+    #define ws_polled_wait()   SleepConditionVariableSRW(&g_ws_polled_cond, &g_ws_polled_lock, INFINITE, 0)
+    #define ws_polled_wake()   WakeAllConditionVariable(&g_ws_polled_cond)
+#else
+static pthread_mutex_t g_ws_polled_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_ws_polled_cond = PTHREAD_COND_INITIALIZER;
+    #define ws_polled_lock()   pthread_mutex_lock(&g_ws_polled_lock)
+    #define ws_polled_unlock() pthread_mutex_unlock(&g_ws_polled_lock)
+    #define ws_polled_wait()   pthread_cond_wait(&g_ws_polled_cond, &g_ws_polled_lock)
+    #define ws_polled_wake()   pthread_cond_broadcast(&g_ws_polled_cond)
+#endif
+
+void colyseus_ws_set_polled(bool polled) {
+    __atomic_store_n(&g_ws_polled_default, polled ? 1 : 0, __ATOMIC_RELEASE);
+}
+
+/* Internal (room.c, latency.c) */
+bool colyseus_ws_polled_default(void) {
+    return __atomic_load_n(&g_ws_polled_default, __ATOMIC_ACQUIRE) != 0;
+}
+
+static bool ws_polled_add(colyseus_transport_t* transport) {
+    bool added = false;
+    ws_polled_lock();
+    int free_slot = -1;
+    for (int i = 0; i < g_ws_polled_cap; i++) {
+        if (g_ws_polled_list[i] == transport) { added = true; break; }
+        if (!g_ws_polled_list[i] && free_slot < 0) free_slot = i;
+    }
+    if (!added && free_slot < 0) {
+        int cap = g_ws_polled_cap ? g_ws_polled_cap * 2 : 8;
+        colyseus_transport_t** grown = realloc(g_ws_polled_list, (size_t)cap * sizeof(*grown));
+        if (grown) {
+            memset(grown + g_ws_polled_cap, 0, (size_t)(cap - g_ws_polled_cap) * sizeof(*grown));
+            free_slot = g_ws_polled_cap;
+            g_ws_polled_list = grown;
+            g_ws_polled_cap = cap;
+        }
+    }
+    if (!added && free_slot >= 0) {
+        g_ws_polled_list[free_slot] = transport;
+        added = true;
+    }
+    ws_polled_unlock();
+    return added;
+}
+
+/* Drops a polled transport from the list and, off the poll thread, waits out
+ * a tick in flight — after this no poll touches it. */
+static void ws_polled_detach(colyseus_transport_t* transport, bool wait_tick) {
+    colyseus_ws_transport_data_t* data = (colyseus_ws_transport_data_t*)transport->impl_data;
+    if (!data->polled) return;
+    ws_polled_lock();
+    for (int i = 0; i < g_ws_polled_cap; i++) {
+        if (g_ws_polled_list[i] == transport) g_ws_polled_list[i] = NULL;
+    }
+    while (wait_tick && g_ws_ticking == transport) ws_polled_wait();
+    ws_polled_unlock();
+}
+
+/* `running`, `state` and `destroy_owner` cross threads. The header keeps them
+ * plain so Zig's translate-c still sees the struct; the ordering lives here. */
+#define ws_load(p)     __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define ws_store(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+
+struct colyseus_ws_outbox_msg {
+    struct colyseus_ws_outbox_msg* next;
+    size_t length;
+    uint8_t data[];
+};
 
 /* Runtime-gated diagnostics: set COLYSEUS_WS_DEBUG=1 in the environment to enable.
  * This keeps pre-push hooks / non-CI runs quiet while still letting Windows CI
@@ -65,6 +180,8 @@ static void ws_hex_dump(const char* tag, const uint8_t* buf, size_t len) {
 static void ws_connect_impl(colyseus_transport_t* transport, const char* url);
 static void ws_send_impl(colyseus_transport_t* transport, const uint8_t* data, size_t length);
 static void ws_send_unreliable_impl(colyseus_transport_t* transport, const uint8_t* data, size_t length);
+static void ws_flush_inline(colyseus_transport_t* transport);
+static void ws_outbox_drain(colyseus_ws_transport_data_t* data);
 static void ws_close_impl(colyseus_transport_t* transport, int code, const char* reason);
 static bool ws_is_open_impl(const colyseus_transport_t* transport);
 static void ws_destroy_impl(colyseus_transport_t* transport);
@@ -82,7 +199,10 @@ static int ws_tls_handshake_tick(colyseus_ws_transport_data_t* data);
 static thread_return_t THREAD_CALL ws_tick_thread_func(void* arg);
 static void ws_tick_once(colyseus_transport_t* transport);
 static bool ws_connect_init(colyseus_ws_transport_data_t* data);
-static bool ws_connect_tick(colyseus_ws_transport_data_t* data);
+static int ws_connect_tick(colyseus_ws_transport_data_t* data);
+static void ws_socket_configure(colyseus_ws_transport_data_t* data);
+static bool ws_open_next_addr(colyseus_ws_transport_data_t* data);
+static void ws_free_addrs(colyseus_ws_transport_data_t* data);
 static bool ws_http_handshake_init(colyseus_ws_transport_data_t* data);
 static bool ws_http_handshake_send(colyseus_ws_transport_data_t* data);
 static bool ws_http_handshake_receive(colyseus_ws_transport_data_t* data);
@@ -125,7 +245,7 @@ colyseus_transport_t* colyseus_websocket_transport_create(const colyseus_transpo
     }
 
     memset(data, 0, sizeof(colyseus_ws_transport_data_t));
-    data->state = COLYSEUS_WS_DISCONNECTED;
+    ws_store(&data->state, COLYSEUS_WS_DISCONNECTED);
     data->running = false;
     data->pending_close = false;
     data->pending_close_code = 0;
@@ -138,6 +258,7 @@ colyseus_transport_t* colyseus_websocket_transport_create(const colyseus_transpo
     data->tls_ctx = NULL;
     data->ca_pem_data = NULL;
     data->ca_pem_len = 0;
+    ws_lock_init(&data->outbox_lock);
 
     transport->impl_data = data;
 
@@ -151,7 +272,7 @@ static void ws_connect_impl(colyseus_transport_t* transport, const char* url) {
 
     WS_LOG("Connect called: %s (TLS=%d, skip_verify=%d)", url, data->use_tls, data->tls_skip_verify);
 
-    if (data->state != COLYSEUS_WS_DISCONNECTED) {
+    if (ws_load(&data->state) != COLYSEUS_WS_DISCONNECTED) {
         WS_LOG("Already connecting/connected, state=%d", data->state);
         return;
     }
@@ -169,16 +290,36 @@ static void ws_connect_impl(colyseus_transport_t* transport, const char* url) {
     }
 
     WS_LOG("Socket initialized, starting state machine");
-    data->state = COLYSEUS_WS_CONNECTING;
+    ws_store(&data->state, COLYSEUS_WS_CONNECTING);
     data->running = true;
+
+    data->polled = data->connect_mode == WS_MODE_DEFAULT
+        ? colyseus_ws_polled_default()
+        : data->connect_mode == WS_MODE_POLLED;
+    if (data->polled) {
+        if (ws_polled_add(transport)) return;
+        /* no list slot (OOM): failing beats a silent fallback to a thread */
+        data->running = false;
+        data->polled = false;
+        ws_socket_close(data);
+        ws_free_addrs(data);
+        ws_store(&data->state, COLYSEUS_WS_DISCONNECTED);
+        free(data->url);
+        data->url = NULL;
+        if (transport->events.on_error) {
+            transport->events.on_error("Failed to initialize connection", transport->events.userdata);
+        }
+        return;
+    }
 
     /* Create tick thread */
 #ifdef _WIN32
     data->tick_thread = CreateThread(NULL, 0, ws_tick_thread_func, transport, 0, NULL);
 #else
+    /* Published before the thread exists: its first tick may already close. */
     pthread_t* thread = malloc(sizeof(pthread_t));
-    pthread_create(thread, NULL, ws_tick_thread_func, transport);
     data->tick_thread = thread;
+    pthread_create(thread, NULL, ws_tick_thread_func, transport);
 #endif
 
     WS_LOG("Tick thread created");
@@ -187,22 +328,79 @@ static void ws_connect_impl(colyseus_transport_t* transport, const char* url) {
 static void ws_send_impl(colyseus_transport_t* transport, const uint8_t* data, size_t length) {
     colyseus_ws_transport_data_t* impl = (colyseus_ws_transport_data_t*)transport->impl_data;
 
-    WS_LOG("ws_send_impl called: state=%d length=%zu", impl->state, length);
     ws_hex_dump("ws_send_impl_payload", data, length);
 
-    if (impl->state != COLYSEUS_WS_CONNECTED) {
-        WS_LOG("ws_send_impl: DROPPING - not connected (state=%d)", impl->state);
+    colyseus_ws_state_t state = ws_load(&impl->state);
+    WS_LOG("ws_send_impl called: state=%d length=%zu", state, length);
+    if (state != COLYSEUS_WS_CONNECTED) {
+        WS_LOG("ws_send_impl: DROPPING - not connected (state=%d)", state);
         return;
     }
 
-    struct wslay_event_msg msg = {
-        .opcode = WSLAY_BINARY_FRAME,
-        .msg = data,
-        .msg_length = length
-    };
+    struct colyseus_ws_outbox_msg* msg = malloc(sizeof(*msg) + length);
+    if (!msg) return;
+    msg->next = NULL;
+    msg->length = length;
+    memcpy(msg->data, data, length);
 
-    int qret = wslay_event_queue_msg(impl->wslay_ctx, &msg);
-    WS_LOG("wslay_event_queue_msg returned %d", qret);
+    ws_lock(&impl->outbox_lock);
+    if (impl->outbox_tail) impl->outbox_tail->next = msg;
+    else impl->outbox_head = msg;
+    impl->outbox_tail = msg;
+    ws_unlock(&impl->outbox_lock);
+
+    ws_flush_inline(transport);
+}
+
+/* Polled mode: a send on the polling thread, outside any tick, goes out now
+ * instead of on the next poll — an input must not wait a frame. Any other
+ * thread leaves it queued. */
+static void ws_flush_inline(colyseus_transport_t* transport) {
+    colyseus_ws_transport_data_t* data = (colyseus_ws_transport_data_t*)transport->impl_data;
+    if (!data->polled || ws_current_tick) return;
+    if (__atomic_load_n(&g_ws_poll_thread, __ATOMIC_ACQUIRE) != &ws_thread_token) return;
+
+    /* the claim a poll takes, so a close from another thread waits this out */
+    ws_polled_lock();
+    bool claimed = !g_ws_ticking && ws_load(&data->running);
+    if (claimed) g_ws_ticking = transport;
+    ws_polled_unlock();
+    if (!claimed) return;
+
+    if (ws_load(&data->state) == COLYSEUS_WS_CONNECTED && !data->send_failed) {
+        ws_outbox_drain(data);
+        /* closing here would fire on_close from inside the caller's send() */
+        if (wslay_event_send(data->wslay_ctx) != 0) data->send_failed = true;
+    }
+
+    ws_polled_lock();
+    g_ws_ticking = NULL;
+    ws_polled_wake();
+    ws_polled_unlock();
+}
+
+/* Move queued sends into wslay; with no context (teardown) they are dropped.
+ * Tick thread only, or the closer once the tick thread is joined. */
+static void ws_outbox_drain(colyseus_ws_transport_data_t* data) {
+    ws_lock(&data->outbox_lock);
+    struct colyseus_ws_outbox_msg* msg = data->outbox_head;
+    data->outbox_head = data->outbox_tail = NULL;
+    ws_unlock(&data->outbox_lock);
+
+    while (msg) {
+        struct colyseus_ws_outbox_msg* next = msg->next;
+        if (data->wslay_ctx) {
+            struct wslay_event_msg wmsg = {
+                .opcode = WSLAY_BINARY_FRAME,
+                .msg = msg->data,
+                .msg_length = msg->length
+            };
+            int qret = wslay_event_queue_msg(data->wslay_ctx, &wmsg);
+            if (qret != 0) WS_LOG("wslay_event_queue_msg returned %d", qret);
+        }
+        free(msg);
+        msg = next;
+    }
 }
 
 static void ws_send_unreliable_impl(colyseus_transport_t* transport, const uint8_t* data, size_t length) {
@@ -212,24 +410,15 @@ static void ws_send_unreliable_impl(colyseus_transport_t* transport, const uint8
     (void)length;
 }
 
-/* Whether the caller is the tick thread itself (it must not wait for itself). Its identity, not a flag: a flag
- * that says "the tick thread is running" is true for every other thread too while it runs. */
+/* Whether the calling thread IS this transport's tick thread. */
 static bool ws_on_tick_thread(const colyseus_ws_transport_data_t* data) {
-    if (!data->tick_thread) {
-        return false;
-    }
-#ifdef _WIN32
-    return GetThreadId((HANDLE)data->tick_thread) == GetCurrentThreadId();
-#else
-    return pthread_equal(*(const pthread_t*)data->tick_thread, pthread_self());
-#endif
+    return ws_current_tick == data;
 }
 
-/* Waits for the tick thread to return (it checks `running` every 10 ms) and releases its handle. */
+/* Join the tick thread. Never from the tick thread itself: after a destroy
+ * from one of its callbacks the loop detaches and frees itself on exit. */
 static void ws_join_tick_thread(colyseus_ws_transport_data_t* data) {
-    if (!data->tick_thread) {
-        return;
-    }
+    if (!data->tick_thread) return;
 #ifdef _WIN32
     WaitForSingleObject(data->tick_thread, INFINITE);
     CloseHandle(data->tick_thread);
@@ -241,71 +430,143 @@ static void ws_join_tick_thread(colyseus_ws_transport_data_t* data) {
     data->tick_thread = NULL;
 }
 
-static void ws_close_impl(colyseus_transport_t* transport, int code, const char* reason) {
+/* Best effort, after whatever is still queued. Tick thread only, or the
+ * closer once the tick thread is joined. */
+static void ws_send_close_frame(colyseus_ws_transport_data_t* data, int code, const char* reason) {
+    if (!data->wslay_ctx || ws_load(&data->state) != COLYSEUS_WS_CONNECTED) return;
+    ws_outbox_drain(data);
+    wslay_event_queue_close(data->wslay_ctx, code, (const uint8_t*)reason, reason ? strlen(reason) : 0);
+    wslay_event_send(data->wslay_ctx);
+}
+
+/* The teardown both closers share: ws_close_impl below, and the loop finishing
+ * a deferred close on its way out. */
+static void ws_finish_close(colyseus_transport_t* transport, int code, const char* reason) {
     colyseus_ws_transport_data_t* data = (colyseus_ws_transport_data_t*)transport->impl_data;
-
-    /* From within the tick thread (a receive error, the server's close): it can't wait for itself, so the
-     * close is deferred to the end of its loop. */
-    if (ws_on_tick_thread(data)) {
-        if (data->state == COLYSEUS_WS_DISCONNECTED) {
-            return;
-        }
-        WS_LOG("Close called from tick thread - deferring");
-        data->pending_close = true;
-        data->pending_close_code = code;
-        free(data->pending_close_reason);
-        data->pending_close_reason = reason ? strdup(reason) : NULL;
-        data->running = false;  /* Signal thread to exit */
-        return;
-    }
-
-    /* Any other thread: stop the tick thread and wait for it before touching what it uses (the TLS context,
-     * the socket, wslay), and before destroy() frees the transport. */
-    data->running = false;
-    ws_join_tick_thread(data);
-
-    if (data->state == COLYSEUS_WS_DISCONNECTED) {
-        return;  /* Never connected, or the tick thread's deferred close did it all. */
-    }
-
-    if (data->wslay_ctx && data->state == COLYSEUS_WS_CONNECTED) {
-        wslay_event_queue_close(data->wslay_ctx, code, (const uint8_t*)reason, reason ? strlen(reason) : 0);
-        wslay_event_send(data->wslay_ctx);
-    }
-
     ws_tls_cleanup(data);
     ws_socket_close(data);
     ws_cleanup_wslay(data);
-
-    data->state = COLYSEUS_WS_DISCONNECTED;
-
-    if (transport->events.on_close) {
+    ws_outbox_drain(data);
+    ws_store(&data->state, COLYSEUS_WS_DISCONNECTED);
+    /* A destroy from inside a callback ends the callbacks. */
+    if (transport->events.on_close && ws_load(&data->destroy_owner) != COLYSEUS_WS_DESTROY_LOOP) {
         transport->events.on_close(code, reason, transport->events.userdata);
     }
 }
 
+static void ws_close_impl(colyseus_transport_t* transport, int code, const char* reason) {
+    colyseus_ws_transport_data_t* data = (colyseus_ws_transport_data_t*)transport->impl_data;
+
+    if (ws_load(&data->state) == COLYSEUS_WS_DISCONNECTED) {
+        /* The loop closed on its way out and on_close has fired; a caller
+         * reaps the thread before destroy() frees the struct. */
+        if (!ws_on_tick_thread(data)) {
+            ws_polled_detach(transport, true);
+            ws_join_tick_thread(data);
+        }
+        return;
+    }
+
+    /* Only defer when the CALLER is the tick thread: joining yourself would
+     * deadlock, so the thread has to finish the close on its way out. Any
+     * other caller must join here — deferring for them leaves the close with
+     * nobody to complete it, and destroy() then frees this struct while the
+     * loop is still reading it. */
+    if (ws_on_tick_thread(data)) {
+        if (data->pending_close) return;  /* the first close's code is the one reported */
+        WS_LOG("Close called from tick thread - deferring");
+        /* wslay dispatches every buffered frame in one recv: no message after close */
+        if (data->wslay_ctx) wslay_event_shutdown_read(data->wslay_ctx);
+        data->pending_close = true;
+        data->pending_close_code = code;
+        free(data->pending_close_reason);
+        data->pending_close_reason = reason ? strdup(reason) : NULL;
+        ws_store(&data->running, false);
+        return;
+    }
+
+    ws_store(&data->running, false);
+
+    /* Join before releasing anything the loop reads: `running` is only checked
+     * at the top of an iteration, so the thread can still be inside
+     * mbedtls_ssl_read. No lock here — the join is the handoff. A polled
+     * transport's "thread" is the poll currently ticking it. */
+    ws_polled_detach(transport, true);
+    ws_join_tick_thread(data);
+
+    /* The loop closed on its own way out; on_close has already fired. */
+    if (data->state == COLYSEUS_WS_DISCONNECTED) return;
+
+    ws_send_close_frame(data, code, reason);
+    ws_finish_close(transport, code, reason);
+}
+
 static bool ws_is_open_impl(const colyseus_transport_t* transport) {
     colyseus_ws_transport_data_t* data = (colyseus_ws_transport_data_t*)transport->impl_data;
-    return data->state == COLYSEUS_WS_CONNECTED;
+    return ws_load(&data->state) == COLYSEUS_WS_CONNECTED;
+}
+
+static void ws_free(colyseus_transport_t* transport) {
+    colyseus_ws_transport_data_t* data = (colyseus_ws_transport_data_t*)transport->impl_data;
+    ws_polled_detach(transport, false);
+    ws_free_addrs(data);
+    free(data->url);
+    free(data->url_host);
+    sdsfree(data->url_path);
+    free(data->client_key);
+    free(data->buffer);
+    free(data->pending_close_reason);
+    ws_outbox_drain(data);
+    ws_lock_destroy(&data->outbox_lock);
+    free(data);
+    free(transport);
 }
 
 static void ws_destroy_impl(colyseus_transport_t* transport) {
     if (!transport) return;
+    colyseus_ws_transport_data_t* data = (colyseus_ws_transport_data_t*)transport->impl_data;
+
+    /* Nested (destroy from inside on_close of a destroy): the outer one frees. */
+    if (ws_load(&data->destroy_owner) != COLYSEUS_WS_DESTROY_NONE) return;
+
+    bool by_loop = ws_on_tick_thread(data);
+    ws_store(&data->destroy_owner, by_loop ? COLYSEUS_WS_DESTROY_LOOP : COLYSEUS_WS_DESTROY_CALLER);
 
     ws_close_impl(transport, 1000, "Normal closure");
 
+    /* From a callback on the tick thread the loop frees on its way out. */
+    if (!by_loop) ws_free(transport);
+}
+
+/* Where a tick loop ends — the thread's exit, or colyseus_ws_poll dropping a
+ * polled transport: finish a deferred close, and free when a destroy from
+ * inside a callback left that to the loop. */
+static void ws_loop_exit(colyseus_transport_t* transport, bool threaded) {
     colyseus_ws_transport_data_t* data = (colyseus_ws_transport_data_t*)transport->impl_data;
-    if (data) {
-        free(data->url);
-        free(data->url_host);
-        sdsfree(data->url_path);
-        free(data->client_key);
-        free(data->buffer);
-        free(data->pending_close_reason);
-        free(data);
+
+    if (data->pending_close) {
+        int code = data->pending_close_code;
+        char* reason = data->pending_close_reason;
+        data->pending_close_reason = NULL;
+        data->pending_close = false;
+        WS_LOG("Handling deferred close: code=%d, reason=%s", code, reason ? reason : "(null)");
+
+        ws_send_close_frame(data, code, reason);
+        ws_finish_close(transport, code, reason);
+        free(reason);
     }
 
-    free(transport);
+    if (ws_load(&data->destroy_owner) == COLYSEUS_WS_DESTROY_LOOP) {
+        if (threaded) {
+#ifdef _WIN32
+            CloseHandle(data->tick_thread);
+#else
+            pthread_detach(pthread_self());
+            free(data->tick_thread);
+#endif
+        }
+        ws_free(transport);
+    }
 }
 
 /* Tick thread */
@@ -313,7 +574,9 @@ static thread_return_t THREAD_CALL ws_tick_thread_func(void* arg) {
     colyseus_transport_t* transport = (colyseus_transport_t*)arg;
     colyseus_ws_transport_data_t* data = (colyseus_ws_transport_data_t*)transport->impl_data;
 
-    while (data->running) {
+    ws_current_tick = data;
+
+    while (ws_load(&data->running)) {
         ws_tick_once(transport);
 
 #ifdef _WIN32
@@ -323,28 +586,8 @@ static thread_return_t THREAD_CALL ws_tick_thread_func(void* arg) {
 #endif
     }
 
-    /* Handle deferred close (was requested from within tick thread) */
-    if (data->pending_close) {
-        WS_LOG("Handling deferred close: code=%d, reason=%s",
-               data->pending_close_code,
-               data->pending_close_reason ? data->pending_close_reason : "(null)");
-
-        ws_tls_cleanup(data);
-        ws_socket_close(data);
-        ws_cleanup_wslay(data);
-
-        data->state = COLYSEUS_WS_DISCONNECTED;
-
-        if (transport->events.on_close) {
-            transport->events.on_close(data->pending_close_code,
-                                       data->pending_close_reason,
-                                       transport->events.userdata);
-        }
-
-        free(data->pending_close_reason);
-        data->pending_close_reason = NULL;
-        data->pending_close = false;
-    }
+    /* Deferred close / loop-owned free finish here, on the tick thread. */
+    ws_loop_exit(transport, true);
 
 #ifdef _WIN32
     return 0;
@@ -357,12 +600,20 @@ static void ws_tick_once(colyseus_transport_t* transport) {
     colyseus_ws_transport_data_t* data = (colyseus_ws_transport_data_t*)transport->impl_data;
 
     if (data->state == COLYSEUS_WS_CONNECTED) {
+        if (data->send_failed) {
+            ws_close_impl(transport, 1006, "Send error");
+            return;
+        }
+
         int ret = wslay_event_recv(data->wslay_ctx);
         if (ret != 0) {
             WS_LOG("wslay_event_recv error: %d", ret);
             ws_close_impl(transport, 1006, "Receive error");
             return;
         }
+
+        /* After recv so a send from an on_message handler leaves this tick. */
+        ws_outbox_drain(data);
 
         ret = wslay_event_send(data->wslay_ctx);
         if (ret != 0) {
@@ -383,7 +634,12 @@ static void ws_tick_once(colyseus_transport_t* transport) {
 
     /* State machine */
     if (data->state == COLYSEUS_WS_CONNECTING) {
-        if (ws_connect_tick(data)) {
+        int connected = ws_connect_tick(data);
+        if (connected < 0) {
+            ws_close_impl(transport, 1006, "Connection refused");
+            return;
+        }
+        if (connected > 0) {
             WS_LOG("TCP connected");
             if (data->use_tls) {
                 const char* tls_err = "TLS init failed";
@@ -391,9 +647,9 @@ static void ws_tick_once(colyseus_transport_t* transport) {
                     ws_close_impl(transport, 1006, tls_err);
                     return;
                 }
-                data->state = COLYSEUS_WS_TLS_HANDSHAKE;
+                ws_store(&data->state, COLYSEUS_WS_TLS_HANDSHAKE);
             } else {
-                data->state = COLYSEUS_WS_HANDSHAKE_SENDING;
+                ws_store(&data->state, COLYSEUS_WS_HANDSHAKE_SENDING);
                 ws_http_handshake_init(data);
             }
         }
@@ -402,7 +658,7 @@ static void ws_tick_once(colyseus_transport_t* transport) {
         int hs = ws_tls_handshake_tick(data);
         if (hs == WS_TLS_HS_DONE) {
             WS_LOG("TLS handshake complete");
-            data->state = COLYSEUS_WS_HANDSHAKE_SENDING;
+            ws_store(&data->state, COLYSEUS_WS_HANDSHAKE_SENDING);
             ws_http_handshake_init(data);
         } else if (hs == WS_TLS_HS_CERT_FAILED) {
             ws_close_impl(transport, 1015, "TLS certificate verification failed");
@@ -415,13 +671,13 @@ static void ws_tick_once(colyseus_transport_t* transport) {
     else if (data->state == COLYSEUS_WS_HANDSHAKE_SENDING) {
         if (ws_http_handshake_send(data)) {
             WS_LOG("Handshake sent");
-            data->state = COLYSEUS_WS_HANDSHAKE_RECEIVING;
+            ws_store(&data->state, COLYSEUS_WS_HANDSHAKE_RECEIVING);
         }
     }
     else if (data->state == COLYSEUS_WS_HANDSHAKE_RECEIVING) {
         if (ws_http_handshake_receive(data)) {
             WS_LOG("Handshake received, WS connected");
-            data->state = COLYSEUS_WS_CONNECTED;
+            ws_store(&data->state, COLYSEUS_WS_CONNECTED);
 
             /* Initialize wslay */
             struct wslay_event_callbacks callbacks = {
@@ -465,12 +721,29 @@ static bool ws_connect_init(colyseus_ws_transport_data_t* data) {
 
     colyseus_url_parts_free(parts);
 
-    /* Create socket */
-    data->socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (data->socket_fd < 0) {
+    /* Every resolved address is a candidate: `localhost` may be served on ::1 only */
+    struct addrinfo hints, *list = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", data->url_port);
+
+    if (getaddrinfo(data->url_host, port_str, &hints, &list) != 0) {
         return false;
     }
+    data->addr_list = list;
+    data->addr_cur = list;
 
+    /* Refused on the spot still reports from the driving thread, like an
+     * asynchronous refusal: ws_connect_tick sees no socket. */
+    ws_open_next_addr(data);
+    return true;
+}
+
+/* Non-blocking, keepalive, and no SIGPIPE on a write to a dead peer. */
+static void ws_socket_configure(colyseus_ws_transport_data_t* data) {
     /* Set non-blocking */
 #ifdef _WIN32
     u_long mode = 1;
@@ -514,43 +787,74 @@ static bool ws_connect_init(colyseus_ws_transport_data_t* data) {
 #endif
 #endif /* _WIN32 */
 
-    /* Resolve hostname using getaddrinfo (modern, alignment-safe) */
-    struct addrinfo hints, *result;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", data->url_port);
-    
-    if (getaddrinfo(data->url_host, port_str, &hints, &result) != 0) {
-        ws_socket_close(data);
-        return false;
-    }
-
-    /* Connect */
-    connect(data->socket_fd, result->ai_addr, result->ai_addrlen);
-    freeaddrinfo(result);
-
-    return true;
+#ifdef SO_NOSIGPIPE
+    int nosigpipe = 1;
+    setsockopt(data->socket_fd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
+#endif
 }
 
-static bool ws_connect_tick(colyseus_ws_transport_data_t* data) {
-    fd_set write_fds;
+/* Opens the next resolved address and starts its non-blocking connect.
+ * False once every address has been tried. */
+static bool ws_open_next_addr(colyseus_ws_transport_data_t* data) {
+    while (data->addr_cur) {
+        struct addrinfo* ai = (struct addrinfo*)data->addr_cur;
+        data->addr_cur = ai->ai_next;
+
+        data->socket_fd = (int)socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (data->socket_fd < 0) continue;
+        ws_socket_configure(data);
+
+        if (connect(data->socket_fd, ai->ai_addr, (socklen_t)ai->ai_addrlen) == 0) return true;
+#ifdef _WIN32
+        if (WSAGetLastError() == WSAEWOULDBLOCK) return true;
+#else
+        if (errno == EINPROGRESS) return true;
+#endif
+        ws_socket_close(data);
+    }
+    return false;
+}
+
+static void ws_free_addrs(colyseus_ws_transport_data_t* data) {
+    if (data->addr_list) freeaddrinfo((struct addrinfo*)data->addr_list);
+    data->addr_list = NULL;
+    data->addr_cur = NULL;
+}
+
+/* 1 = connected, 0 = still connecting, -1 = every address refused. */
+static int ws_connect_tick(colyseus_ws_transport_data_t* data) {
+    if (data->socket_fd < 0) {
+        ws_free_addrs(data);
+        return -1;
+    }
+
+    /* Windows reports a failed connect in the except set, never as writable —
+     * without it a refused connect stays "connecting" forever. */
+    fd_set write_fds, except_fds;
     FD_ZERO(&write_fds);
+    FD_ZERO(&except_fds);
     FD_SET(data->socket_fd, &write_fds);
+    FD_SET(data->socket_fd, &except_fds);
 
     struct timeval tv = {0, 0};
-    int ret = select(data->socket_fd + 1, NULL, &write_fds, NULL, &tv);
+    int ret = select(data->socket_fd + 1, NULL, &write_fds, &except_fds, &tv);
 
-    if (ret > 0 && FD_ISSET(data->socket_fd, &write_fds)) {
+    bool failed = ret > 0 && FD_ISSET(data->socket_fd, &except_fds);
+    if (ret > 0 && (failed || FD_ISSET(data->socket_fd, &write_fds))) {
         int error = 0;
         socklen_t len = sizeof(error);
         getsockopt(data->socket_fd, SOL_SOCKET, SO_ERROR, (char*)&error, &len);
-        return error == 0;
+        if (error == 0 && !failed) {
+            ws_free_addrs(data);
+            return 1;
+        }
+        ws_socket_close(data);
+        if (ws_open_next_addr(data)) return 0;
+        ws_free_addrs(data);
+        return -1;
     }
 
-    return false;
+    return 0;
 }
 
 static bool ws_http_handshake_init(colyseus_ws_transport_data_t* data) {
@@ -725,7 +1029,7 @@ static void ws_on_msg_recv_callback(wslay_event_context_ptr ctx, const struct ws
                 fflush(stderr);
             }
             ws_hex_dump("close_payload", arg->msg, arg->msg_length);
-            data->state = COLYSEUS_WS_REMOTE_DISCONNECT;
+            ws_store(&data->state, COLYSEUS_WS_REMOTE_DISCONNECT);
         }
         // wslay handles ping/pong automatically
     } else {
@@ -866,6 +1170,13 @@ static ssize_t ws_socket_recv(colyseus_ws_transport_data_t* data, uint8_t* buf, 
     return ret;
 }
 
+/* Linux: no SIGPIPE per send. Apple sets SO_NOSIGPIPE on the socket instead. */
+#ifdef MSG_NOSIGNAL
+#define WS_SEND_FLAGS MSG_NOSIGNAL
+#else
+#define WS_SEND_FLAGS 0
+#endif
+
 static ssize_t ws_socket_send(colyseus_ws_transport_data_t* data, const uint8_t* buf, size_t len, int* would_block) {
     *would_block = 0;
 
@@ -883,7 +1194,7 @@ static ssize_t ws_socket_send(colyseus_ws_transport_data_t* data, const uint8_t*
         return ret;
     }
 
-    ssize_t ret = send(data->socket_fd, (const char*)buf, len, 0);
+    ssize_t ret = send(data->socket_fd, (const char*)buf, len, WS_SEND_FLAGS);
 
     if (ret < 0) {
 #ifdef _WIN32
@@ -922,7 +1233,7 @@ static void ws_cleanup_wslay(colyseus_ws_transport_data_t* data) {
 
 static int tls_bio_send(void* ctx, const unsigned char* buf, size_t len) {
     int fd = *(int*)ctx;
-    ssize_t ret = send(fd, (const char*)buf, len, 0);
+    ssize_t ret = send(fd, (const char*)buf, len, WS_SEND_FLAGS);
     if (ret < 0) {
 #ifdef _WIN32
         if (WSAGetLastError() == WSAEWOULDBLOCK) return MBEDTLS_ERR_SSL_WANT_WRITE;
@@ -1116,11 +1427,48 @@ void colyseus_websocket_connect_with_settings(colyseus_transport_t* transport,
     transport->connect(transport, url);
 }
 
-void colyseus_http_poll(void) {
-    /* Native HTTP is synchronous - no polling needed */
+/* Internal (room.c, latency.c): fix the mode a socket connects in, whatever
+ * the process default is by then. Other transports are left alone. */
+void colyseus_ws_pin_polled(colyseus_transport_t* transport, bool polled) {
+    if (!transport || transport->connect != ws_connect_impl) return;
+    colyseus_ws_transport_data_t* data = (colyseus_ws_transport_data_t*)transport->impl_data;
+    data->connect_mode = polled ? WS_MODE_POLLED : WS_MODE_THREADED;
 }
 
+/* Threaded transports tick on their own thread; polled ones tick here, on the
+ * caller's thread. */
 void colyseus_ws_poll(void) {
-    /* Native WebSocket runs on its own thread - no polling needed */
+    /* From inside a callback: the socket being ticked is mid-recv. */
+    if (ws_current_tick) return;
+
+    __atomic_store_n(&g_ws_poll_thread, &ws_thread_token, __ATOMIC_RELEASE);
+
+    for (int i = 0;; i++) {
+        ws_polled_lock();
+        if (i >= g_ws_polled_cap) {
+            ws_polled_unlock();
+            break;
+        }
+        /* another thread's poll or inline flush holds a socket: wait it out */
+        while (g_ws_ticking) ws_polled_wait();
+        colyseus_transport_t* t = g_ws_polled_list[i];
+        if (t) g_ws_ticking = t;
+        ws_polled_unlock();
+        if (!t) continue;
+
+        colyseus_ws_transport_data_t* data = (colyseus_ws_transport_data_t*)t->impl_data;
+        ws_current_tick = data;
+        if (ws_load(&data->running)) ws_tick_once(t);
+        if (!ws_load(&data->running)) {
+            ws_polled_detach(t, false);
+            ws_loop_exit(t, false); /* may free t */
+        }
+        ws_current_tick = NULL;
+
+        ws_polled_lock();
+        g_ws_ticking = NULL;
+        ws_polled_wake();
+        ws_polled_unlock();
+    }
 }
 

@@ -1,17 +1,31 @@
 #include "colyseus/room.h"
+#include "colyseus/client.h"
+#include "colyseus/room_clock.h"
+#include "colyseus/input_handle.h"
 #include "colyseus/websocket_transport.h"
 #include "colyseus/schema.h"
+#include "colyseus/schema/callbacks.h"
 #include "colyseus/messages.h"
 #include "colyseus/utils/time.h"
 #include <stdlib.h>
+#include <assert.h>
 #include <string.h>
 #include <stdio.h>
 
-/* Platform-specific threading + sleep */
+/* Reconnection schedulers:
+ * - Polled: a deadline state machine advanced by colyseus_reconnect_poll() —
+ *   and so by colyseus_poll() — on the polling thread. A room takes it when
+ *   it first connects in polled mode (colyseus_set_polled). It is the only
+ *   one on Emscripten (single-threaded; a GDExtension side module cannot
+ *   receive JS callbacks at all) and in native builds compiled with
+ *   -DCOLYSEUS_RECONNECT_POLLED.
+ * - Threaded (native default): a dedicated retry thread with a timed
+ *   condvar wait. */
+#if defined(__EMSCRIPTEN__) || defined(COLYSEUS_RECONNECT_POLLED)
+    #define COLYSEUS_RECONNECT_POLLED_ONLY 1
+#endif
 #ifdef __EMSCRIPTEN__
-    /* Reconnection worker is a no-op stub on Emscripten — the browser SDK
-     * already handles reconnect through its own event loop, and we cannot
-     * block in a worker thread anyway. */
+    /* single-threaded */
 #elif defined(_WIN32)
     #include <windows.h>
 #else
@@ -21,10 +35,76 @@
     #include <time.h>
 #endif
 
+/* Internal (websocket_transport.c / websocket_transport_web.c) */
+bool colyseus_ws_polled_default(void);
+void colyseus_ws_pin_polled(colyseus_transport_t* transport, bool polled);
+
 /* Internal helper functions */
 static void room_on_transport_open(void* userdata);
 static void room_on_transport_message(const uint8_t* data, size_t length, void* userdata);
 static void room_on_transport_close(int code, const char* reason, void* userdata);
+static void room_handle_frame(colyseus_room_t* room, const uint8_t* data, size_t length);
+static void room_handle_close(colyseus_room_t* room, int code, const char* reason);
+
+/* Frames that fire the room's callbacks bump room->dispatch_depth, on any
+ * thread. This thread's are also listed here, so colyseus_room_free can catch
+ * a free from inside one: a callback on another thread doesn't return into
+ * the freed room, destroying the transport waits it out. Nesting deeper than
+ * the list goes untracked. */
+#define ROOM_DISPATCH_TRACKED 8
+static _Thread_local const colyseus_room_t* tl_dispatching[ROOM_DISPATCH_TRACKED];
+static _Thread_local int tl_dispatch_depth = 0;
+
+static void room_dispatch_enter(colyseus_room_t* room) {
+    __atomic_fetch_add(&room->dispatch_depth, 1, __ATOMIC_RELAXED);
+    if (tl_dispatch_depth < ROOM_DISPATCH_TRACKED) tl_dispatching[tl_dispatch_depth] = room;
+    tl_dispatch_depth++;
+}
+static void room_dispatch_exit(colyseus_room_t* room) {
+    tl_dispatch_depth--;
+    __atomic_fetch_sub(&room->dispatch_depth, 1, __ATOMIC_RELAXED);
+}
+#ifndef NDEBUG
+static bool room_dispatching(const colyseus_room_t* room) {
+    int n = tl_dispatch_depth < ROOM_DISPATCH_TRACKED ? tl_dispatch_depth : ROOM_DISPATCH_TRACKED;
+    for (int i = 0; i < n; i++) {
+        if (tl_dispatching[i] == room) return true;
+    }
+    return false;
+}
+#endif
+
+/* on_leave fires from the reconnection worker and from leave() as well, not
+ * only from the transport's close. */
+static void room_notify_leave(colyseus_room_t* room, int code, const char* reason) {
+    if (!room->on_leave) return;
+    room_dispatch_enter(room);
+    room->on_leave(code, reason, room->on_leave_userdata);
+    room_dispatch_exit(room);
+}
+
+/* colyseus_room_connect()'s callbacks: the first outcome fires one of them,
+ * once. */
+static void room_connect_settle(colyseus_room_t* room, bool joined, int code, const char* message) {
+    void (*on_success)(void*) = room->connect_on_success;
+    void (*on_error)(int, const char*, void*) = room->connect_on_error;
+    room->connect_on_success = NULL;
+    room->connect_on_error = NULL;
+    if (joined) {
+        if (on_success) on_success(room->connect_userdata);
+    } else if (on_error) {
+        on_error(code, message, room->connect_userdata);
+    }
+}
+
+/* Any thread. */
+static bool room_has_left(const colyseus_room_t* room) {
+    return __atomic_load_n(&room->left, __ATOMIC_ACQUIRE);
+}
+static bool room_is_leaving(const colyseus_room_t* room) {
+    return __atomic_load_n(&room->leaving, __ATOMIC_ACQUIRE);
+}
+
 static void room_on_transport_error(const char* error, void* userdata);
 static void room_dispatch_message(colyseus_room_t* room, const char* type, const uint8_t* message, size_t length);
 static void room_dispatch_message_bytes(colyseus_room_t* room, const char* type, const uint8_t* message, size_t length);
@@ -35,6 +115,9 @@ static char* room_get_message_key_int(int type);
 static float decode_number(const uint8_t* bytes, size_t* offset);
 static char* decode_string(const uint8_t* bytes, size_t* offset);
 
+/* Request/response helpers */
+static void room_reject_all_pending_requests(colyseus_room_t* room, const char* reason);
+
 /* Reconnection helpers */
 static void room_enqueue_message(colyseus_room_t* room, const uint8_t* data, size_t length);
 static void room_clear_message_queue(colyseus_room_t* room);
@@ -43,46 +126,165 @@ static bool room_send_or_enqueue(colyseus_room_t* room, const uint8_t* data, siz
 static char* room_build_reconnect_url(const colyseus_room_t* room);
 static void room_handle_reconnection(colyseus_room_t* room, int code, const char* reason);
 static void room_reconnection_signal_attempt_done(colyseus_room_t* room);
-static void room_reconnection_signal_success(colyseus_room_t* room);
+static bool room_reconnection_signal_success(colyseus_room_t* room);
 static void room_reconnection_cancel(colyseus_room_t* room);
+static void room_finish(colyseus_room_t* room, int code, const char* reason);
 static void room_reconnection_init(colyseus_room_t* room);
+static void room_reconnection_lock(const colyseus_room_t* room);
+static void room_reconnection_unlock(const colyseus_room_t* room);
+static void room_reconnection_stop(colyseus_room_t* room);
 static void room_reconnection_teardown(colyseus_room_t* room);
 
-/* Reconnection worker:
- * - On native (pthreads/Win32), a dedicated thread runs the retry loop with
- *   a timed condvar wait. Cancelling sets `cancelled=true` and signals.
- * - On Emscripten, the worker is a no-op: automatic reconnection is not
- *   currently supported in the browser build (the JS event loop driving
- *   `emscripten_fetch` cannot host a blocking retry loop).
+/* Reconnection worker. Both schedulers share the struct; which one a room
+ * uses is latched on its first connect (room_reconnection_latch).
+ * - Polled: room_handle_reconnection arms a deadline; colyseus_reconnect_poll()
+ *   fires the attempt once it passes. No threads involved.
+ * - Threaded: a dedicated thread runs the retry loop with a timed condvar
+ *   wait. Cancelling sets `cancelled=true` and signals.
  */
 typedef struct colyseus_reconnection_worker {
-#ifdef __EMSCRIPTEN__
-    int _unused;
-#elif defined(_WIN32)
+    bool latched;                /* the two modes below are fixed */
+    bool polled;                 /* colyseus_reconnect_poll() schedules the attempts */
+    bool sockets_polled;         /* pinned on every socket the room opens */
+    bool pending_attempt;        /* attempt in flight — waiting on open/close */
+    uint64_t next_attempt_at_ms; /* polled: 0 = no attempt scheduled */
+    int transport_users;         /* threaded: callers using room->transport off the retry thread */
+    bool awaiting_users;         /* threaded: the retry thread waits for them before a swap */
+    bool dropping;               /* on_drop is running, before the cycle starts */
+#ifndef COLYSEUS_RECONNECT_POLLED_ONLY
+#ifdef _WIN32
     HANDLE thread;
     CRITICAL_SECTION mutex;
     CONDITION_VARIABLE cond;
-    bool thread_started;
-    bool pending_attempt;
 #else
     pthread_t thread;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
-    bool thread_started;
-    bool pending_attempt;
+#endif
+    bool thread_started;         /* a thread exists and must be joined */
+    bool thread_done;            /* ...but has finished its cycle */
 #endif
 } colyseus_reconnection_worker_t;
 
+/* Rooms on the polled scheduler, walked by colyseus_reconnect_poll(). Locked
+ * because a room can be created or freed off the polling thread; slots are
+ * nulled, never compacted, so the poll can walk by index while a callback
+ * creates a room. */
+static colyseus_room_t** g_reconnect_rooms = NULL;
+static int g_reconnect_cap = 0;
 #ifdef __EMSCRIPTEN__
+    #define RECONNECT_REG_LOCK()   ((void)0)
+    #define RECONNECT_REG_UNLOCK() ((void)0)
+#elif defined(_WIN32)
+static SRWLOCK g_reconnect_reg_lock = SRWLOCK_INIT;
+    #define RECONNECT_REG_LOCK()   AcquireSRWLockExclusive(&g_reconnect_reg_lock)
+    #define RECONNECT_REG_UNLOCK() ReleaseSRWLockExclusive(&g_reconnect_reg_lock)
+#else
+static pthread_mutex_t g_reconnect_reg_lock = PTHREAD_MUTEX_INITIALIZER;
+    #define RECONNECT_REG_LOCK()   pthread_mutex_lock(&g_reconnect_reg_lock)
+    #define RECONNECT_REG_UNLOCK() pthread_mutex_unlock(&g_reconnect_reg_lock)
+#endif
+
+static bool room_reconnect_register(colyseus_room_t* room) {
+    bool added = false;
+    RECONNECT_REG_LOCK();
+    int free_slot = -1;
+    for (int i = 0; i < g_reconnect_cap; i++) {
+        if (g_reconnect_rooms[i] == room) { added = true; break; }
+        if (!g_reconnect_rooms[i] && free_slot < 0) free_slot = i;
+    }
+    if (!added && free_slot < 0) {
+        int cap = g_reconnect_cap ? g_reconnect_cap * 2 : 16;
+        colyseus_room_t** grown = realloc(g_reconnect_rooms, (size_t)cap * sizeof(*grown));
+        if (grown) {
+            memset(grown + g_reconnect_cap, 0, (size_t)(cap - g_reconnect_cap) * sizeof(*grown));
+            free_slot = g_reconnect_cap;
+            g_reconnect_rooms = grown;
+            g_reconnect_cap = cap;
+        }
+    }
+    if (!added && free_slot >= 0) {
+        g_reconnect_rooms[free_slot] = room;
+        added = true;
+    }
+    RECONNECT_REG_UNLOCK();
+    return added;
+}
+
+static void room_reconnect_unregister(colyseus_room_t* room) {
+    RECONNECT_REG_LOCK();
+    for (int i = 0; i < g_reconnect_cap; i++) {
+        if (g_reconnect_rooms[i] == room) g_reconnect_rooms[i] = NULL;
+    }
+    RECONNECT_REG_UNLOCK();
+}
 
 static colyseus_reconnection_worker_t* room_worker_create(void) {
-    return NULL;
-}
-static void room_worker_destroy(colyseus_reconnection_worker_t* w) { (void)w; }
-
-#else
-
+    colyseus_reconnection_worker_t* w = calloc(1, sizeof(*w));
+    if (!w) return NULL;
+#ifndef COLYSEUS_RECONNECT_POLLED_ONLY
 #ifdef _WIN32
+    InitializeCriticalSection(&w->mutex);
+    InitializeConditionVariable(&w->cond);
+#else
+    pthread_mutex_init(&w->mutex, NULL);
+    pthread_cond_init(&w->cond, NULL);
+#endif
+#endif
+    return w;
+}
+
+static void room_worker_destroy(colyseus_reconnection_worker_t* w) {
+    if (!w) return;
+#ifndef COLYSEUS_RECONNECT_POLLED_ONLY
+#ifdef _WIN32
+    DeleteCriticalSection(&w->mutex);
+#else
+    pthread_mutex_destroy(&w->mutex);
+    pthread_cond_destroy(&w->cond);
+#endif
+#endif
+    free(w);
+}
+
+#ifndef COLYSEUS_RECONNECT_POLLED_ONLY
+/* Whether this room's attempts come from colyseus_reconnect_poll(). */
+static bool room_reconnect_is_polled(const colyseus_reconnection_worker_t* w) {
+    return w->polled;
+}
+#endif
+
+/* Fixes the room's modes on its first connect: the scheduler follows
+ * colyseus_set_polled(), the sockets colyseus_ws_set_polled(). Flipping
+ * either later leaves this room — and every socket it reopens — as it was. */
+static void room_reconnection_latch(colyseus_room_t* room) {
+    colyseus_reconnection_worker_t* w =
+        (colyseus_reconnection_worker_t*)room->reconnection.worker;
+    if (!w || w->latched) return;
+    w->latched = true;
+#ifdef COLYSEUS_RECONNECT_POLLED_ONLY
+    w->polled = true;
+#else
+    w->polled = colyseus_is_polled();
+#endif
+    w->sockets_polled = colyseus_ws_polled_default();
+    if (w->polled && !room_reconnect_register(room)) {
+        fprintf(stderr, "colyseus: out of memory — room '%s' will not auto-reconnect\n",
+            room->name ? room->name : "?");
+    }
+}
+
+static void room_pin_socket_mode(colyseus_room_t* room) {
+    colyseus_reconnection_worker_t* w =
+        (colyseus_reconnection_worker_t*)room->reconnection.worker;
+    if (w && room->transport) colyseus_ws_pin_polled(room->transport, w->sockets_polled);
+}
+
+#ifdef COLYSEUS_RECONNECT_POLLED_ONLY
+    #define WORKER_LOCK(w)   ((void)(w))
+    #define WORKER_UNLOCK(w) ((void)(w))
+    #define WORKER_SIGNAL(w) ((void)(w))
+#elif defined(_WIN32)
     #define WORKER_LOCK(w)   EnterCriticalSection(&(w)->mutex)
     #define WORKER_UNLOCK(w) LeaveCriticalSection(&(w)->mutex)
     #define WORKER_SIGNAL(w) WakeConditionVariable(&(w)->cond)
@@ -92,32 +294,7 @@ static void room_worker_destroy(colyseus_reconnection_worker_t* w) { (void)w; }
     #define WORKER_SIGNAL(w) pthread_cond_signal(&(w)->cond)
 #endif
 
-static colyseus_reconnection_worker_t* room_worker_create(void) {
-    colyseus_reconnection_worker_t* w = malloc(sizeof(*w));
-    if (!w) return NULL;
-    memset(w, 0, sizeof(*w));
-#ifdef _WIN32
-    InitializeCriticalSection(&w->mutex);
-    InitializeConditionVariable(&w->cond);
-#else
-    pthread_mutex_init(&w->mutex, NULL);
-    pthread_cond_init(&w->cond, NULL);
-#endif
-    w->thread_started = false;
-    w->pending_attempt = false;
-    return w;
-}
-
-static void room_worker_destroy(colyseus_reconnection_worker_t* w) {
-    if (!w) return;
-#ifdef _WIN32
-    DeleteCriticalSection(&w->mutex);
-#else
-    pthread_mutex_destroy(&w->mutex);
-    pthread_cond_destroy(&w->cond);
-#endif
-    free(w);
-}
+#ifndef COLYSEUS_RECONNECT_POLLED_ONLY
 
 /* Wait on the worker condvar for up to delay_ms milliseconds. Caller holds
  * the worker mutex. */
@@ -146,19 +323,9 @@ static void room_worker_wait(colyseus_reconnection_worker_t* w) {
 #endif
 }
 
-#endif /* __EMSCRIPTEN__ */
+#endif /* !COLYSEUS_RECONNECT_POLLED_ONLY */
 
-/* ── Reconnection worker (native only) ─────────────────────────── */
-
-#ifndef __EMSCRIPTEN__
-
-#ifdef _WIN32
-typedef DWORD worker_return_t;
-#define WORKER_THREAD_CALL WINAPI
-#else
-typedef void* worker_return_t;
-#define WORKER_THREAD_CALL
-#endif
+/* ── Backoff + attempt (shared by both schedulers) ─────────────── */
 
 static int room_compute_backoff_delay(const colyseus_reconnection_options_t* opts, int attempt) {
     /* (1 << attempt) * delay_ms, clamped to [min_delay_ms, max_delay_ms].
@@ -171,13 +338,14 @@ static int room_compute_backoff_delay(const colyseus_reconnection_options_t* opt
     return (int)delay;
 }
 
-static void room_attempt_reconnect(colyseus_room_t* room) {
+/* `old` is the closed transport, already detached from room->transport by
+ * the caller (under the retry lock, on the threaded scheduler). */
+static void room_attempt_reconnect(colyseus_room_t* room, colyseus_transport_t* old) {
     /* Tear down the closed transport and start a fresh one with an updated
      * URL. The attempt resolves with on_open → JOIN_ROOM (success), on_close
      * (failure) or on_error (connect() failed before a socket existed). */
-    if (room->transport) {
-        colyseus_transport_destroy(room->transport);
-        room->transport = NULL;
+    if (old) {
+        colyseus_transport_destroy(old);
     }
 
     colyseus_transport_events_t events = {
@@ -188,7 +356,11 @@ static void room_attempt_reconnect(colyseus_room_t* room) {
         .userdata = room
     };
 
-    room->transport = room->transport_factory(&events);
+    colyseus_transport_t* transport = room->transport_factory(&events);
+    room_reconnection_lock(room);
+    room->transport = transport;
+    room_reconnection_unlock(room);
+    room_pin_socket_mode(room);
     if (!room->transport) {
         /* Treat as an immediate failure; the close path will route us back
          * into the worker for another retry. */
@@ -215,6 +387,47 @@ static void room_attempt_reconnect(colyseus_room_t* room) {
     free(url);
 }
 
+/* ── Polled scheduler ──────────────────────────────────────────── */
+
+/* Mirror of the thread loop's ordering — increment → max-check → delay.
+ * Returns false when retries are exhausted (the room has been notified). */
+static bool room_reconnection_schedule_next(colyseus_room_t* room) {
+    colyseus_reconnection_worker_t* w =
+        (colyseus_reconnection_worker_t*)room->reconnection.worker;
+    room->reconnection.retry_count++;
+
+    if (room->reconnection.retry_count > room->reconnection.options.max_retries) {
+        room->reconnection.is_reconnecting = false;
+        if (w) {
+            w->pending_attempt = false;
+            w->next_attempt_at_ms = 0;
+        }
+        room_finish(room, COLYSEUS_CLOSE_FAILED_TO_RECONNECT,
+                    "No more retries. Reconnection failed.");
+        return false;
+    }
+
+    if (w) {
+        w->pending_attempt = false;
+        w->next_attempt_at_ms = colyseus_monotonic_ms()
+            + (uint64_t)room_compute_backoff_delay(&room->reconnection.options,
+                                                   room->reconnection.retry_count);
+    }
+    return true;
+}
+
+#ifndef COLYSEUS_RECONNECT_POLLED_ONLY
+
+/* ── Threaded scheduler ────────────────────────────────────────── */
+
+#ifdef _WIN32
+typedef DWORD worker_return_t;
+#define WORKER_THREAD_CALL WINAPI
+#else
+typedef void* worker_return_t;
+#define WORKER_THREAD_CALL
+#endif
+
 static worker_return_t WORKER_THREAD_CALL room_reconnect_worker_func(void* arg) {
     colyseus_room_t* room = (colyseus_room_t*)arg;
     colyseus_reconnection_worker_t* w =
@@ -226,15 +439,10 @@ static worker_return_t WORKER_THREAD_CALL room_reconnect_worker_func(void* arg) 
 
         if (room->reconnection.retry_count > room->reconnection.options.max_retries) {
             room->reconnection.is_reconnecting = false;
+            w->thread_done = true;
             WORKER_UNLOCK(w);
-            if (room->serializer) {
-                colyseus_schema_serializer_teardown(room->serializer);
-            }
-            if (room->on_leave) {
-                room->on_leave(COLYSEUS_CLOSE_FAILED_TO_RECONNECT,
-                               "No more retries. Reconnection failed.",
-                               room->on_leave_userdata);
-            }
+            room_finish(room, COLYSEUS_CLOSE_FAILED_TO_RECONNECT,
+                        "No more retries. Reconnection failed.");
             goto done;
         }
 
@@ -242,13 +450,25 @@ static worker_return_t WORKER_THREAD_CALL room_reconnect_worker_func(void* arg) 
                                                room->reconnection.retry_count);
 
         room_worker_timedwait(w, delay);
+
+        /* a caller still using the old socket holds off its destroy */
+        w->awaiting_users = true;
+        while (w->transport_users > 0
+               && !room->reconnection.cancelled
+               && room->reconnection.is_reconnecting) {
+            room_worker_wait(w);
+        }
+        w->awaiting_users = false;
         if (room->reconnection.cancelled || !room->reconnection.is_reconnecting) {
             break;
         }
 
+        /* detached in this lock hold: no caller can pick it up any more */
+        colyseus_transport_t* old = room->transport;
+        room->transport = NULL;
         w->pending_attempt = true;
         WORKER_UNLOCK(w);
-        room_attempt_reconnect(room);
+        room_attempt_reconnect(room, old);
         WORKER_LOCK(w);
 
         /* Wait for either a successful JOIN_ROOM (sets is_reconnecting=false
@@ -260,7 +480,16 @@ static worker_return_t WORKER_THREAD_CALL room_reconnect_worker_func(void* arg) 
             room_worker_wait(w);
         }
     }
+    /* left mid-attempt: this thread swaps room->transport, so it closes its own */
+    bool abort_attempt = room_has_left(room) && w->pending_attempt;
+    /* exit is decided and published under the same lock hold, so a spawn
+     * for the next drop either finds us still looping (and we serve it) or
+     * finds thread_done and reaps us — never a thread that is "about to" exit */
+    w->thread_done = true;
     WORKER_UNLOCK(w);
+    if (abort_attempt) {
+        colyseus_transport_close(room->transport, 1000, "Leave");
+    }
 
 done:
 #ifdef _WIN32
@@ -270,13 +499,19 @@ done:
 #endif
 }
 
+static void room_reconnect_worker_join(colyseus_reconnection_worker_t* w);
+
 static void room_reconnect_worker_spawn(colyseus_room_t* room) {
     colyseus_reconnection_worker_t* w =
         (colyseus_reconnection_worker_t*)room->reconnection.worker;
     if (!w) return;
     /* Caller must already hold w->mutex. */
-    if (w->thread_started) return;
+    if (w->thread_started) {
+        if (!w->thread_done) return;   /* this cycle's thread is still running */
+        room_reconnect_worker_join(w); /* the previous cycle's — reap it */
+    }
     w->thread_started = true;
+    w->thread_done = false;
 #ifdef _WIN32
     w->thread = CreateThread(NULL, 0, room_reconnect_worker_func, room, 0, NULL);
 #else
@@ -296,7 +531,34 @@ static void room_reconnect_worker_join(colyseus_reconnection_worker_t* w) {
     w->thread_started = false;
 }
 
-#endif /* !__EMSCRIPTEN__ */
+#endif /* !COLYSEUS_RECONNECT_POLLED_ONLY */
+
+void colyseus_reconnect_poll(void) {
+    uint64_t now = colyseus_monotonic_ms();
+    for (int i = 0;; i++) {
+        RECONNECT_REG_LOCK();
+        bool end = i >= g_reconnect_cap;
+        colyseus_room_t* room = end ? NULL : g_reconnect_rooms[i];
+        RECONNECT_REG_UNLOCK();
+        if (end) break;
+        if (!room || !room->reconnection.is_reconnecting || room->reconnection.cancelled) {
+            continue;
+        }
+        colyseus_reconnection_worker_t* w =
+            (colyseus_reconnection_worker_t*)room->reconnection.worker;
+        if (!w || w->pending_attempt) continue;
+        if (w->next_attempt_at_ms == 0 || now < w->next_attempt_at_ms) continue;
+
+        w->next_attempt_at_ms = 0;
+        w->pending_attempt = true;
+        colyseus_transport_t* old = room->transport;
+        room->transport = NULL;
+        /* May fail synchronously → on_close → schedule_next / give-up (which
+         * can fire on_leave, where the app may free the room) — so `room`
+         * must not be touched after this call. */
+        room_attempt_reconnect(room, old);
+    }
+}
 
 /* ── Reconnection state lifecycle ──────────────────────────────── */
 
@@ -322,62 +584,150 @@ static void room_reconnection_init(colyseus_room_t* room) {
     room->reconnection.worker = room_worker_create();
 }
 
-static void room_reconnection_teardown(colyseus_room_t* room) {
+/* Ends retrying for good: once this returns no retry cycle runs or starts. */
+static void room_reconnection_stop(colyseus_room_t* room) {
     room_reconnection_cancel(room);
-    room_clear_message_queue(room);
-
-    colyseus_reconnection_worker_t* w =
-        (colyseus_reconnection_worker_t*)room->reconnection.worker;
-#ifndef __EMSCRIPTEN__
-    room_reconnect_worker_join(w);
+    room_reconnect_unregister(room);
+#ifndef COLYSEUS_RECONNECT_POLLED_ONLY
+    room_reconnect_worker_join((colyseus_reconnection_worker_t*)room->reconnection.worker);
 #endif
-    room_worker_destroy(w);
+}
+
+/* After the transport is destroyed: its thread's callbacks use the worker
+ * and the queue until then. */
+static void room_reconnection_teardown(colyseus_room_t* room) {
+    room_clear_message_queue(room);
+    room_worker_destroy((colyseus_reconnection_worker_t*)room->reconnection.worker);
     room->reconnection.worker = NULL;
 }
 
-static void room_reconnection_cancel(colyseus_room_t* room) {
-#ifdef __EMSCRIPTEN__
+/* Whether a retry thread runs this room's cycles. While a cycle runs, that
+ * thread alone swaps room->transport. */
+static bool room_reconnect_is_threaded(const colyseus_room_t* room) {
+#ifdef COLYSEUS_RECONNECT_POLLED_ONLY
     (void)room;
+    return false;
 #else
-    colyseus_reconnection_worker_t* w =
-        (colyseus_reconnection_worker_t*)room->reconnection.worker;
-    if (!w) return;
-    WORKER_LOCK(w);
-    room->reconnection.cancelled = true;
-    room->reconnection.is_reconnecting = false;
-    WORKER_SIGNAL(w);
-    WORKER_UNLOCK(w);
+    const colyseus_reconnection_worker_t* w =
+        (const colyseus_reconnection_worker_t*)room->reconnection.worker;
+    return w && !room_reconnect_is_polled(w);
 #endif
 }
 
-static void room_reconnection_signal_success(colyseus_room_t* room) {
-#ifdef __EMSCRIPTEN__
-    (void)room;
-#else
+/* Guards the retry state against the retry thread. A polled room's scheduler
+ * runs on its caller's thread and needs none. */
+static void room_reconnection_lock(const colyseus_room_t* room) {
+    if (room_reconnect_is_threaded(room)) {
+        WORKER_LOCK((colyseus_reconnection_worker_t*)room->reconnection.worker);
+    }
+}
+
+static void room_reconnection_unlock(const colyseus_room_t* room) {
+    if (room_reconnect_is_threaded(room)) {
+        WORKER_UNLOCK((colyseus_reconnection_worker_t*)room->reconnection.worker);
+    }
+}
+
+/* Caller holds room_reconnection_lock. See room_transport_acquire. */
+static colyseus_transport_t* room_transport_pin_locked(const colyseus_room_t* room) {
+    colyseus_transport_t* transport = room->transport;
+    if (transport && room_reconnect_is_threaded(room)) {
+        ((colyseus_reconnection_worker_t*)room->reconnection.worker)->transport_users++;
+    }
+    return transport;
+}
+
+/* room->transport for a caller off the retry thread, which swaps it during
+ * a cycle: it isn't destroyed until room_transport_release(). The transport
+ * calls happen outside the lock, so one that blocks (a close joining the
+ * socket's thread) or reports back into the room can't deadlock it. */
+static colyseus_transport_t* room_transport_acquire(const colyseus_room_t* room) {
+    room_reconnection_lock(room);
+    colyseus_transport_t* transport = room_transport_pin_locked(room);
+    room_reconnection_unlock(room);
+    return transport;
+}
+
+static void room_transport_release(const colyseus_room_t* room, colyseus_transport_t* transport) {
+    if (!transport || !room_reconnect_is_threaded(room)) return;
     colyseus_reconnection_worker_t* w =
         (colyseus_reconnection_worker_t*)room->reconnection.worker;
-    if (!w) return;
     WORKER_LOCK(w);
-    room->reconnection.is_reconnecting = false;
-    w->pending_attempt = false;
-    room->reconnection.retry_count = 0;
-    WORKER_SIGNAL(w);
+    if (--w->transport_users == 0 && w->awaiting_users) WORKER_SIGNAL(w);
     WORKER_UNLOCK(w);
-#endif
+}
+
+/* Caller holds room_reconnection_lock. */
+static void room_reconnection_cancel_locked(colyseus_room_t* room) {
+    colyseus_reconnection_worker_t* w =
+        (colyseus_reconnection_worker_t*)room->reconnection.worker;
+    room->reconnection.cancelled = true;
+    room->reconnection.is_reconnecting = false;
+    if (!w) return;
+    if (room_reconnect_is_threaded(room)) {
+        WORKER_SIGNAL(w);
+        return;
+    }
+    w->pending_attempt = false;
+    w->next_attempt_at_ms = 0;
+}
+
+static void room_reconnection_cancel(colyseus_room_t* room) {
+    room_reconnection_lock(room);
+    room_reconnection_cancel_locked(room);
+    room_reconnection_unlock(room);
+}
+
+/* Whoever marks the room left first owns its on_leave. */
+static bool room_claim_left(colyseus_room_t* room) {
+    return !__atomic_exchange_n(&room->left, true, __ATOMIC_ACQ_REL);
+}
+
+/* Ends the room: the first caller fires on_leave, later ones do nothing. Any
+ * thread, once no retry cycle is running. leave()'s local path doesn't come
+ * here: it claims the room and cancels the cycle in one lock hold, then fires
+ * on_leave without tearing down the serializer. */
+static void room_finish(colyseus_room_t* room, int code, const char* reason) {
+    if (!room_claim_left(room)) return;
+    if (room->serializer) {
+        colyseus_schema_serializer_teardown(room->serializer);
+    }
+    room_notify_leave(room, code, reason);
+}
+
+/* False once the room has left: the attempt outran leave() and must not
+ * revive it. */
+static bool room_reconnection_signal_success(colyseus_room_t* room) {
+    colyseus_reconnection_worker_t* w =
+        (colyseus_reconnection_worker_t*)room->reconnection.worker;
+    room_reconnection_lock(room);
+    bool revive = !room_has_left(room);
+    if (revive) {
+        room->reconnection.is_reconnecting = false;
+        room->reconnection.retry_count = 0;
+        if (w) {
+            w->pending_attempt = false;
+            w->next_attempt_at_ms = 0;
+        }
+        if (room_reconnect_is_threaded(room)) WORKER_SIGNAL(w);
+    }
+    room_reconnection_unlock(room);
+    return revive;
 }
 
 static void room_reconnection_signal_attempt_done(colyseus_room_t* room) {
-#ifdef __EMSCRIPTEN__
-    (void)room;
-#else
     colyseus_reconnection_worker_t* w =
         (colyseus_reconnection_worker_t*)room->reconnection.worker;
     if (!w) return;
-    WORKER_LOCK(w);
-    w->pending_attempt = false;
-    WORKER_SIGNAL(w);
-    WORKER_UNLOCK(w);
-#endif
+    if (room_reconnect_is_threaded(room)) {
+        WORKER_LOCK(w);
+        w->pending_attempt = false;
+        WORKER_SIGNAL(w);
+        WORKER_UNLOCK(w);
+        return;
+    }
+    if (!w->pending_attempt || !room->reconnection.is_reconnecting || room->reconnection.cancelled) return;
+    room_reconnection_schedule_next(room);
 }
 
 /* ── Pending message queue ─────────────────────────────────────── */
@@ -445,11 +795,16 @@ static void room_flush_message_queue(colyseus_room_t* room) {
  * dropped. */
 static bool room_send_or_enqueue(colyseus_room_t* room, const uint8_t* data, size_t length) {
     if (!room) return false;
-    if (room->transport && colyseus_transport_is_open(room->transport)) {
-        colyseus_transport_send(room->transport, data, length);
-        return true;
-    }
-    if (room->reconnection.is_reconnecting && room->reconnection.options.enabled) {
+    colyseus_transport_t* transport = room_transport_acquire(room);
+    bool sent = colyseus_transport_is_open(transport);
+    if (sent) colyseus_transport_send(transport, data, length);
+    room_transport_release(room, transport);
+    if (sent) return true;
+    /* on_drop runs before the cycle starts, and what it sends is for that cycle */
+    colyseus_reconnection_worker_t* w =
+        (colyseus_reconnection_worker_t*)room->reconnection.worker;
+    bool dropping = w && __atomic_load_n(&w->dropping, __ATOMIC_ACQUIRE);
+    if ((room->reconnection.is_reconnecting || dropping) && room->reconnection.options.enabled) {
         room_enqueue_message(room, data, length);
         return true;
     }
@@ -525,20 +880,16 @@ static bool room_close_code_is_drop(int code) {
 }
 
 static void room_handle_reconnection(colyseus_room_t* room, int code, const char* reason) {
-    (void)code;
-    (void)reason;
-#ifdef __EMSCRIPTEN__
-    /* No worker support on the web build — fall through to on_leave. */
-    if (room->on_leave) {
-        room->on_leave(code, reason, room->on_leave_userdata);
+    /* an on_drop listener may have called leave() */
+    if (room_has_left(room) || room_is_leaving(room)) {
+        room_finish(room, COLYSEUS_CLOSE_CONSENTED, reason);
+        return;
     }
-#else
+
     colyseus_reconnection_worker_t* w =
         (colyseus_reconnection_worker_t*)room->reconnection.worker;
     if (!w) {
-        if (room->on_leave) {
-            room->on_leave(code, reason, room->on_leave_userdata);
-        }
+        room_finish(room, code, reason);
         return;
     }
 
@@ -546,26 +897,46 @@ static void room_handle_reconnection(colyseus_room_t* room, int code, const char
     uint64_t now = colyseus_monotonic_ms();
     if (room->joined_at_ms == 0 ||
         (now - room->joined_at_ms) < (uint64_t)room->reconnection.options.min_uptime_ms) {
-        if (room->serializer) {
-            colyseus_schema_serializer_teardown(room->serializer);
-        }
-        if (room->on_leave) {
-            room->on_leave(COLYSEUS_CLOSE_ABNORMAL_CLOSURE,
-                           "Room uptime too short for reconnection.",
-                           room->on_leave_userdata);
-        }
+        room_finish(room, COLYSEUS_CLOSE_ABNORMAL_CLOSURE,
+                    "Room uptime too short for reconnection.");
         return;
     }
 
-    WORKER_LOCK(w);
+    /* The server allocates a FRESH input buffer for the reconnected client
+     * (its consumed counter restarts at 0) — zero ours so post-reconnect
+     * seqs line up. Observing controllers follow via the handle's epoch. */
+    if (room->input_handle) {
+        colyseus_input_handle_reset(room->input_handle);
+    }
+
+#ifndef COLYSEUS_RECONNECT_POLLED_ONLY
+    if (!room_reconnect_is_polled(w)) {
+        WORKER_LOCK(w);
+        /* leave() on another thread may have landed since the checks above */
+        bool ended = room_has_left(room) || room_is_leaving(room);
+        /* colyseus_room_free cancelled retries and is joining this cycle: no new one */
+        bool cancelled = room->reconnection.cancelled;
+        if (!ended && !cancelled && !room->reconnection.is_reconnecting) {
+            room->reconnection.retry_count = 0;
+            room->reconnection.is_reconnecting = true;
+            room_reconnect_worker_spawn(room);
+        }
+        WORKER_UNLOCK(w);
+        if (ended) room_finish(room, COLYSEUS_CLOSE_CONSENTED, reason);
+        else if (cancelled) room_finish(room, code, reason);
+        return;
+    }
+#endif
+    /* colyseus_room_free cancelled retries: no new cycle */
+    if (room->reconnection.cancelled) {
+        room_finish(room, code, reason);
+        return;
+    }
     if (!room->reconnection.is_reconnecting) {
         room->reconnection.retry_count = 0;
         room->reconnection.is_reconnecting = true;
-        room->reconnection.cancelled = false;
-        room_reconnect_worker_spawn(room);
+        room_reconnection_schedule_next(room); /* arms the first deadline */
     }
-    WORKER_UNLOCK(w);
-#endif
 }
 
 /* ── Room lifecycle ────────────────────────────────────────────── */
@@ -587,6 +958,8 @@ colyseus_room_t* colyseus_room_create(const char* name, colyseus_transport_facto
     room->settings = NULL;
     room->joined_at_ms = 0;
 
+    room->clock = colyseus_room_clock_create();
+
     room_reconnection_init(room);
 
     return room;
@@ -594,16 +967,42 @@ colyseus_room_t* colyseus_room_create(const char* name, colyseus_transport_facto
 
 void colyseus_room_free(colyseus_room_t* room) {
     if (!room) return;
+    /* Under a callback the dispatching frame keeps using the room; see room.h. */
+    assert(!room_dispatching(room) &&
+           "colyseus_room_free called from inside a room callback");
 
-    /* Cancel and join the reconnection worker before tearing down the
-     * transport — the worker may otherwise try to reconnect against a
-     * half-freed room. */
-    room_reconnection_teardown(room);
+    /* Stop retrying before tearing down the transport — a retry would
+     * otherwise swap it, or reconnect against a half-freed room. */
+    room_reconnection_stop(room);
+
+    if (room->callbacks) {
+        colyseus_callbacks_free(room->callbacks);
+        room->callbacks = NULL;
+    }
+
+    /* Drop pending requests (no callbacks — the room is going away) */
+    {
+        colyseus_pending_request_t *entry, *tmp;
+        HASH_ITER(hh, room->pending_requests, entry, tmp) {
+            HASH_DEL(room->pending_requests, entry);
+            free(entry);
+        }
+    }
 
     /* Cleanup transport */
     if (room->transport) {
         colyseus_transport_destroy(room->transport);
     }
+    room_reconnection_teardown(room);
+
+    /* Cleanup input layer + clock */
+    if (room->input_handle) {
+        colyseus_input_handle_free(room->input_handle);
+    }
+    if (room->input_vtable_from_reflection) {
+        colyseus_dynamic_vtable_free((colyseus_dynamic_vtable_t*)room->input_vtable_from_reflection);
+    }
+    colyseus_room_clock_free(room->clock);
 
     /* Cleanup serializer */
     if (room->serializer) {
@@ -659,6 +1058,8 @@ void colyseus_room_connect(
         .userdata = room
     };
 
+    room_reconnection_latch(room);
+
     /* Create transport */
     room->transport = room->transport_factory(&events);
     if (!room->transport) {
@@ -667,6 +1068,7 @@ void colyseus_room_connect(
         }
         return;
     }
+    room_pin_socket_mode(room);
 
     /* Store connection callbacks */
     room->connect_on_success = on_success;
@@ -690,30 +1092,47 @@ void colyseus_room_connect(
 void colyseus_room_leave(colyseus_room_t* room, bool consented) {
     if (!room) return;
 
-    /* Suppress drop-handling for this room and cancel any in-flight retry. */
-    if (consented) {
-        room->reconnection.options.enabled = false;
+    /* decided in one lock hold: no retry cycle can start or land half-way */
+    room_reconnection_lock(room);
+    bool left = room_has_left(room);
+    bool reconnecting = room->reconnection.is_reconnecting;
+    /* a running cycle owns room->transport; otherwise nothing swaps it */
+    bool open = !left && !reconnecting && colyseus_transport_is_open(room->transport);
+    /* a joined room's closed socket may still owe it the server's close
+     * (reported on its next tick or poll): a consented leave waits for it */
+    bool local = consented ? reconnecting || (!room->has_joined && !open) : !open;
+    colyseus_transport_t* transport = NULL;
+    if (!left && local) {
+        left = !room_claim_left(room);
+        if (!left) room_reconnection_cancel_locked(room);
+    } else if (!left) {
+        if (consented) __atomic_store_n(&room->leaving, true, __ATOMIC_RELEASE);
+        /* a drop racing leave(false) may start a cycle that swaps it */
+        if (open) transport = room_transport_pin_locked(room);
     }
-    room_reconnection_cancel(room);
+    room_reconnection_unlock(room);
 
-    if (!room->transport) {
-        if (room->on_leave) {
-            room->on_leave(COLYSEUS_CLOSE_CONSENTED, "Already left", room->on_leave_userdata);
+    /* already left: on_leave doesn't fire again */
+    if (left) return;
+
+    if (!local) {
+        if (!open) return; /* the socket's close ends the room */
+        if (consented) {
+            uint8_t leave_msg[] = { COLYSEUS_PROTOCOL_LEAVE_ROOM };
+            colyseus_transport_send(transport, leave_msg, 1);
+        } else {
+            colyseus_transport_close(transport, 1000, "Leave");
         }
+        room_transport_release(room, transport);
         return;
     }
 
-    if (colyseus_transport_is_open(room->transport)) {
-        if (consented) {
-            uint8_t leave_msg[] = { COLYSEUS_PROTOCOL_LEAVE_ROOM };
-            colyseus_transport_send(room->transport, leave_msg, 1);
-        } else {
-            colyseus_transport_close(room->transport, 1000, "Leave");
-        }
-    } else {
-        if (room->on_leave) {
-            room->on_leave(COLYSEUS_CLOSE_CONSENTED, "Already left", room->on_leave_userdata);
-        }
+    /* reconnecting or still connecting: no socket to tell the server on */
+    room_notify_leave(room, COLYSEUS_CLOSE_CONSENTED, "Already left");
+
+    /* aborts a connect in progress; a retry thread closes its own attempt */
+    if (!reconnecting || !room_reconnect_is_threaded(room)) {
+        colyseus_transport_close(room->transport, 1000, "Leave");
     }
 }
 
@@ -743,7 +1162,112 @@ const char* colyseus_room_get_name(const colyseus_room_t* room) {
 }
 
 bool colyseus_room_is_connected(const colyseus_room_t* room) {
-    return room ? room->has_joined && colyseus_transport_is_open(room->transport) : false;
+    if (!room || !room->has_joined) return false;
+    colyseus_transport_t* transport = room_transport_acquire(room);
+    bool open = colyseus_transport_is_open(transport);
+    room_transport_release(room, transport);
+    return open;
+}
+
+struct colyseus_room_clock* colyseus_room_get_clock(colyseus_room_t* room) {
+    return room ? room->clock : NULL;
+}
+
+struct colyseus_callbacks* colyseus_room_callbacks(colyseus_room_t* room) {
+    if (!room || !room->serializer) return NULL;
+    if (!room->callbacks) {
+        room->callbacks = colyseus_callbacks_create(room->serializer->decoder);
+    }
+    return room->callbacks;
+}
+
+/* input-handle host callbacks — the handle stays transport-agnostic */
+static void room_input_send(const uint8_t* data, size_t length, void* userdata) {
+    colyseus_room_t* room = (colyseus_room_t*)userdata;
+    /* WS-only transport: unreliable falls back to the reliable channel */
+    colyseus_transport_t* transport = room_transport_acquire(room);
+    colyseus_transport_send(transport, data, length);
+    room_transport_release(room, transport);
+}
+
+static bool room_input_is_open(void* userdata) {
+    colyseus_room_t* room = (colyseus_room_t*)userdata;
+    colyseus_transport_t* transport = room_transport_acquire(room);
+    bool open = colyseus_transport_is_open(transport);
+    room_transport_release(room, transport);
+    return open;
+}
+
+static struct colyseus_room_clock* room_input_get_clock(void* userdata) {
+    return ((colyseus_room_t*)userdata)->clock;
+}
+
+struct colyseus_input_handle* colyseus_room_input(
+    colyseus_room_t* room,
+    const colyseus_schema_vtable_t* input_vtable,
+    const void* options) {
+    if (!room) return NULL;
+    if (room->input_handle) {
+        /* One handle per room by design — but silently discarding a second
+         * caller's options is how a lag-comp render_delay or an allow_rewind
+         * gate goes missing without a trace. */
+        if (options) {
+            fprintf(stderr, "colyseus: colyseus_room_input() called again with options on room "
+                "'%s'; the first call's options stand (one input handle per room)\n",
+                room->name ? room->name : "?");
+        }
+        return room->input_handle;
+    }
+
+    const colyseus_schema_vtable_t* vtable = input_vtable
+        ? input_vtable
+        : room->input_vtable_from_reflection;
+    if (!vtable) return NULL; /* no defineInput() on the server and no static vtable */
+
+    const colyseus_input_options_t* opts = (const colyseus_input_options_t*)options;
+    if (opts && opts->unreliable) {
+        fprintf(stderr, "colyseus: colyseus_room_input(): unreliable input is not "
+            "supported yet — it needs a WebTransport datagram channel, and this SDK "
+            "connects over WebSocket only. Use reliable mode.\n");
+        return NULL;
+    }
+    /* dynamic vtables have no base.create — they construct via their own path */
+    colyseus_schema_t* instance = colyseus_vtable_is_dynamic(vtable)
+        ? (colyseus_schema_t*)colyseus_dynamic_schema_create((const colyseus_dynamic_vtable_t*)vtable)
+        : vtable->create();
+    instance->__vtable = vtable;
+    colyseus_input_encoder_t* encoder = colyseus_input_encoder_create(
+        instance, vtable,
+        opts ? opts->unreliable : false,
+        opts ? opts->history_size : 0);
+    if (!encoder) {
+        vtable->destroy(instance);
+        return NULL; /* non-primitive fields */
+    }
+
+    room->input_handle = colyseus_input_handle_create(
+        instance, vtable, encoder,
+        room->input_stamp_render, room->input_stamp_reckon,
+        opts,
+        room->input_tick_rate, room->input_patch_rate, room->input_sub_steps,
+        room_input_send, room_input_is_open, room_input_get_clock, room);
+    return room->input_handle;
+}
+
+void colyseus_room_ping(colyseus_room_t* room, colyseus_room_on_ping_fn callback, void* userdata) {
+    if (!room || !callback) return;
+
+    colyseus_transport_t* transport = room_transport_acquire(room);
+    /* a ping over a dead connection would measure the reconnect, not the RTT */
+    if (colyseus_transport_is_open(transport)) {
+        room->ping_started_at_ms = colyseus_monotonic_ms();
+        room->ping_callback = callback;
+        room->ping_userdata = userdata;
+
+        const uint8_t ping_byte = COLYSEUS_PROTOCOL_PING;
+        colyseus_transport_send(transport, &ping_byte, 1);
+    }
+    room_transport_release(room, transport);
 }
 
 const char* colyseus_room_get_reconnection_token(const colyseus_room_t* room) {
@@ -998,6 +1522,7 @@ void colyseus_room_send(colyseus_room_t* room, const char* type, colyseus_messag
 
     if (encoded_data && encoded_len > 0) {
         colyseus_room_send_encoded(room, type, encoded_data, encoded_len);
+        colyseus_message_encoded_free(encoded_data, encoded_len);
     }
 }
 
@@ -1009,6 +1534,7 @@ void colyseus_room_send_int(colyseus_room_t* room, int type, colyseus_message_t*
 
     if (encoded_data && encoded_len > 0) {
         colyseus_room_send_int_encoded(room, type, encoded_data, encoded_len);
+        colyseus_message_encoded_free(encoded_data, encoded_len);
     }
 }
 
@@ -1068,6 +1594,125 @@ void colyseus_room_send_int_encoded(colyseus_room_t* room, int type, const uint8
 
     room_send_or_enqueue(room, data, total_len);
     free(data);
+}
+
+/* ============================================================================
+ * Request/response (ROOM_REQUEST / ROOM_RESPONSE)
+ * ============================================================================ */
+
+/* One send path for both reply shapes: exactly one callback is non-NULL. */
+static uint32_t room_request_send(colyseus_room_t* room, const char* type,
+    const uint8_t* payload, size_t payload_length,
+    colyseus_room_on_response_fn callback,
+    colyseus_room_on_response_encoded_fn callback_encoded, void* userdata)
+{
+    if (!room || !type || (!callback && !callback_encoded)) return 0;
+
+    /* Ids run from 1: every entry point already returns 0 for "not sent", and
+     * a binding needs to tell that apart from a real id to know whether it has
+     * anything to cancel. */
+    uint32_t request_id = ++room->next_request_id;
+
+    /* Build frame: [ROOM_REQUEST][requestId varint][type string][payload?] */
+    uint8_t request_id_buffer[5];
+    size_t request_id_size = msgpack_encode_number(request_id_buffer, (int)request_id);
+
+    size_t type_len = strlen(type);
+    size_t type_size = (type_len <= 31) ? (1 + type_len) :
+                       (type_len <= 255) ? (2 + type_len) :
+                       (type_len <= 65535) ? (3 + type_len) :
+                       (5 + type_len);
+
+    size_t total_len = 1 + request_id_size + type_size + payload_length;
+    uint8_t* data = malloc(total_len);
+    if (!data) return 0;
+
+    data[0] = COLYSEUS_PROTOCOL_ROOM_REQUEST;
+    memcpy(data + 1, request_id_buffer, request_id_size);
+    size_t encoded_type_len = msgpack_encode_string(data + 1 + request_id_size, type, type_len);
+
+    if (payload && payload_length > 0) {
+        memcpy(data + 1 + request_id_size + encoded_type_len, payload, payload_length);
+    }
+
+    colyseus_pending_request_t* entry = malloc(sizeof(colyseus_pending_request_t));
+    if (!entry) { free(data); return 0; }
+    entry->request_id = request_id;
+    entry->callback = callback;
+    entry->callback_encoded = callback_encoded;
+    entry->userdata = userdata;
+    HASH_ADD(hh, room->pending_requests, request_id, sizeof(uint32_t), entry);
+
+    /* reliable + offline: buffered frames flush on (re)connect */
+    room_send_or_enqueue(room, data, total_len);
+    free(data);
+
+    return request_id;
+}
+
+uint32_t colyseus_room_request_encoded(colyseus_room_t* room, const char* type,
+    const uint8_t* payload, size_t payload_length,
+    colyseus_room_on_response_fn callback, void* userdata)
+{
+    return room_request_send(room, type, payload, payload_length, callback, NULL, userdata);
+}
+
+uint32_t colyseus_room_request_encoded_reply(colyseus_room_t* room, const char* type,
+    const uint8_t* payload, size_t payload_length,
+    colyseus_room_on_response_encoded_fn callback, void* userdata)
+{
+    return room_request_send(room, type, payload, payload_length, NULL, callback, userdata);
+}
+
+uint32_t colyseus_room_request(colyseus_room_t* room, const char* type, colyseus_message_t* payload,
+    colyseus_room_on_response_fn callback, void* userdata)
+{
+    if (!room || !type || !callback) return 0;
+
+    size_t encoded_len = 0;
+    uint8_t* encoded_data = payload ? colyseus_message_encode(payload, &encoded_len) : NULL;
+
+    uint32_t request_id = colyseus_room_request_encoded(room, type, encoded_data, encoded_len, callback, userdata);
+    colyseus_message_encoded_free(encoded_data, encoded_len);
+    return request_id;
+}
+
+void colyseus_room_cancel_request(colyseus_room_t* room, uint32_t request_id) {
+    if (!room) return;
+
+    colyseus_pending_request_t* entry = NULL;
+    HASH_FIND(hh, room->pending_requests, &request_id, sizeof(uint32_t), entry);
+    if (entry) {
+        HASH_DEL(room->pending_requests, entry);
+        free(entry);
+    }
+}
+
+/* The one place an answer reaches a caller, whichever reply shape it asked
+ * for. The reader is built here so the encoded path never pays for it. */
+static void room_deliver_response(colyseus_pending_request_t* entry,
+    colyseus_request_outcome_t outcome, const uint8_t* data, size_t length, const char* reason)
+{
+    if (entry->callback_encoded) {
+        entry->callback_encoded(outcome, data, length, reason, entry->userdata);
+        return;
+    }
+    colyseus_message_reader_t* reader = (data && length > 0)
+        ? colyseus_message_reader_create(data, length)
+        : NULL;
+    entry->callback(outcome == COLYSEUS_REQUEST_OK, reader,
+        outcome == COLYSEUS_REQUEST_FAULTED ? "request faulted" : reason,
+        entry->userdata);
+    if (reader) colyseus_message_reader_free(reader);
+}
+
+static void room_reject_all_pending_requests(colyseus_room_t* room, const char* reason) {
+    colyseus_pending_request_t *entry, *tmp;
+    HASH_ITER(hh, room->pending_requests, entry, tmp) {
+        HASH_DEL(room->pending_requests, entry);
+        room_deliver_response(entry, COLYSEUS_REQUEST_CLOSED, NULL, 0, reason);
+        free(entry);
+    }
 }
 
 /* Send raw bytes (ROOM_DATA_BYTES protocol) */
@@ -1136,7 +1781,12 @@ static void room_on_transport_open(void* userdata) {
 
 static void room_on_transport_message(const uint8_t* data, size_t length, void* userdata) {
     colyseus_room_t* room = (colyseus_room_t*)userdata;
+    room_dispatch_enter(room);
+    room_handle_frame(room, data, length);
+    room_dispatch_exit(room);
+}
 
+static void room_handle_frame(colyseus_room_t* room, const uint8_t* data, size_t length) {
     if (length == 0) return;
 
     {
@@ -1151,8 +1801,25 @@ static void room_on_transport_message(const uint8_t* data, size_t length, void* 
         }
     }
 
-    colyseus_protocol_t code = (colyseus_protocol_t)data[0];
+    /* Strip modifier bits (bits 5..7) so the dispatch below stays
+     * modifier-agnostic; consume any modifier-attached prefix bytes here. */
+    uint8_t raw_byte = data[0];
+    colyseus_protocol_t code = (colyseus_protocol_t)(raw_byte & COLYSEUS_PROTOCOL_CODE_MASK);
     size_t offset = 1;
+
+    if (raw_byte & COLYSEUS_PROTOCOL_MODIFIER_TIMED) {
+        /* [uint32 sNow][uint32 inputSeq] — server time (ms since room start)
+         * + last PROCESSED input seq. The input ack goes to the handle (it
+         * owns the round-trip); its RTT sample + sNow feed the clock. */
+        colyseus_iterator_t timed_it = { .offset = (int)offset };
+        double s_now = (double)colyseus_decode_uint32(data, &timed_it);
+        int input_seq = (int)colyseus_decode_uint32(data, &timed_it);
+        offset = (size_t)timed_it.offset;
+        double rtt_sample = room->input_handle
+            ? colyseus_input_handle_ack_input(room->input_handle, input_seq)
+            : -1;
+        colyseus_room_clock_sample(room->clock, s_now, rtt_sample);
+    }
 
     switch (code) {
         case COLYSEUS_PROTOCOL_JOIN_ROOM: {
@@ -1193,6 +1860,21 @@ static void room_on_transport_message(const uint8_t* data, size_t length, void* 
 
             bool is_reconnect = room->has_joined;
 
+            /* State reflection is length-prefixed: the schema handshake must
+             * not read past it into the trailing tagged-section bytes. A
+             * zero length means reconnect (the serializer already has state).
+             * A legacy/foreign peer puts raw reflection here instead of a
+             * length — decode_number then yields NaN or nonsense, and a
+             * network parser must not trap on that: clamp to the frame. */
+            double raw_reflection_len = (offset < length)
+                ? (double)decode_number(data, &offset)
+                : 0;
+            size_t state_reflection_len =
+                (raw_reflection_len > 0 && raw_reflection_len <= (double)(length - offset))
+                    ? (size_t)raw_reflection_len
+                    : 0;
+            size_t reflection_end = offset + state_reflection_len;
+
             /* On first join only: instantiate serializer + apply handshake.
              * On reconnect, the server replays JOIN_ROOM with just the
              * reconnection token + serializer ID (skipHandshake=1) and we
@@ -1202,9 +1884,9 @@ static void room_on_transport_message(const uint8_t* data, size_t length, void* 
                     /* Create serializer - pass NULL if no vtable, handshake will auto-detect */
                     room->serializer = colyseus_schema_serializer_create(room->state_vtable);
 
-                    /* Handle handshake if there's more data */
-                    if (offset < length && room->serializer) {
-                        colyseus_schema_serializer_handshake(room->serializer, data, length, (int)offset);
+                    if (state_reflection_len > 0 && room->serializer) {
+                        /* bounded: the reflection decoder reads until `length` */
+                        colyseus_schema_serializer_handshake(room->serializer, data, reflection_end, (int)offset);
 
                         /* If auto-detection happened, copy the vtable reference to room */
                         if (!room->state_vtable) {
@@ -1228,18 +1910,66 @@ static void room_on_transport_message(const uint8_t* data, size_t length, void* 
                 }
             }
 
+            offset = reflection_end;
+
+            /* Trailing tagged sections: [tag byte][length varint][payload].
+             * Unknown tags are skipped via length (forward-compatible). */
+            while (offset < length) {
+                uint8_t tag = data[offset++];
+                double raw_section_len = (double)decode_number(data, &offset);
+                /* !(x >= 0) also catches NaN — malformed section, stop parsing */
+                if (!(raw_section_len >= 0) || raw_section_len > (double)(length - offset)) break;
+                size_t section_len = (size_t)raw_section_len;
+                size_t section_end = offset + section_len;
+
+                if (tag == COLYSEUS_HANDSHAKE_INPUT_REFLECTION) {
+                    /* schema reflection of the input struct — synthesize its
+                     * vtable so colyseus_room_input() works without a static
+                     * one. Reconnect replays this section: the live input
+                     * handle (and every predict view over it) holds the
+                     * existing vtable, so never free/rebuild it under them —
+                     * the schema cannot change within one room anyway. */
+                    if (!room->input_vtable_from_reflection) {
+                        room->input_vtable_from_reflection =
+                            colyseus_build_input_vtable_from_reflection(data, section_end, (int)offset);
+                    }
+
+                } else if (tag == COLYSEUS_HANDSHAKE_INPUT_OPTIONS) {
+                    /* [flags u8][varints in bit order] */
+                    uint8_t flags = data[offset++];
+                    room->input_stamp_render = (flags & COLYSEUS_INPUT_FLAG_RENDER_TIME) != 0;
+                    room->input_stamp_reckon = (flags & COLYSEUS_INPUT_FLAG_RECKON_TIME) != 0;
+                    if (flags & COLYSEUS_INPUT_FLAG_FIXED_TIMESTEP) room->input_tick_rate = (int)decode_number(data, &offset);
+                    if (flags & COLYSEUS_INPUT_FLAG_PATCH_RATE) room->input_patch_rate = (int)decode_number(data, &offset);
+                    if (flags & COLYSEUS_INPUT_FLAG_SUB_STEPS) room->input_sub_steps = (int)decode_number(data, &offset);
+                }
+
+                offset = section_end;
+            }
+
+            /* hand the snapshot cadence to the clock once the loop has it */
+            if (room->input_patch_rate > 0) {
+                colyseus_room_clock_set_patch_interval(room->clock, room->input_patch_rate);
+            }
+
+            /* the attempt outran leave(), which couldn't abort it: don't revive,
+             * and don't ack — an acked rejoin is a seat the server holds */
+            if (is_reconnect && !room_reconnection_signal_success(room)) {
+                colyseus_transport_close(room->transport, 1000, "Leave");
+                break;
+            }
+
             /* Acknowledge JOIN_ROOM */
             uint8_t ack[] = { COLYSEUS_PROTOCOL_JOIN_ROOM };
             colyseus_transport_send(room->transport, ack, 1);
 
             if (is_reconnect) {
-                /* Tell the worker the attempt succeeded, flush any buffered
-                 * messages, then fire on_reconnect. */
-                room_reconnection_signal_success(room);
                 room_flush_message_queue(room);
                 if (room->on_reconnect) {
                     room->on_reconnect(room->on_reconnect_userdata);
                 }
+            } else {
+                room_connect_settle(room, true, 0, NULL);
             }
             break;
         }
@@ -1249,8 +1979,17 @@ static void room_on_transport_message(const uint8_t* data, size_t length, void* 
             int error_code = (int)decode_number(data, &offset);
             char* error_message = decode_string(data, &offset);
 
+            /* before the join this is the join failing, and the server closes
+             * right behind it */
+            if (!room->has_joined) room->join_error_reported = true;
+
             if (room->on_error) {
                 room->on_error(error_code, error_message ? error_message : "Unknown error", room->on_error_userdata);
+            }
+
+            /* the close behind it reports nothing more */
+            if (!room->has_joined) {
+                room_connect_settle(room, false, error_code, error_message ? error_message : "Unknown error");
             }
 
             free(error_message);
@@ -1338,14 +2077,73 @@ static void room_on_transport_message(const uint8_t* data, size_t length, void* 
             break;
         }
 
+        case COLYSEUS_PROTOCOL_PING: {
+            /* server echo of colyseus_room_ping() */
+            if (room->ping_callback) {
+                colyseus_room_on_ping_fn callback = room->ping_callback;
+                room->ping_callback = NULL;
+                callback((int)(colyseus_monotonic_ms() - room->ping_started_at_ms), room->ping_userdata);
+            }
+            break;
+        }
+
+        case COLYSEUS_PROTOCOL_ROOM_RESPONSE: {
+            /* reply to a pending colyseus_room_request() */
+            uint32_t request_id = (uint32_t)decode_number(data, &offset);
+            if (offset >= length) break;
+            uint8_t status = data[offset++];
+
+            colyseus_pending_request_t* entry = NULL;
+            HASH_FIND(hh, room->pending_requests, &request_id, sizeof(uint32_t), entry);
+
+            /* already answered (e.g. cancelled) or unknown id — ignore */
+            if (entry) {
+                HASH_DEL(room->pending_requests, entry);
+
+                /* the ONE place the wire's statuses become the caller's
+                 * outcome — see colyseus_request_outcome_t */
+                colyseus_request_outcome_t outcome =
+                    status == COLYSEUS_RESPONSE_OK ? COLYSEUS_REQUEST_OK :
+                    status == COLYSEUS_RESPONSE_REJECTED ? COLYSEUS_REQUEST_REJECTED :
+                    COLYSEUS_REQUEST_FAULTED;
+
+                const uint8_t* reply = NULL;
+                size_t reply_length = 0;
+                if (length > offset) {
+                    reply = data + offset;
+                    reply_length = length - offset;
+                }
+
+                room_deliver_response(entry, outcome, reply, reply_length, NULL);
+                free(entry);
+            }
+            break;
+        }
+
         default:
             fprintf(stderr, "Unknown protocol message: %d\n", code);
             break;
     }
 }
 
+void colyseus_room_process_message(colyseus_room_t* room, const uint8_t* data, size_t length) {
+    if (!room || !data || length == 0) return;
+    room_on_transport_message(data, length, room);
+}
+
 static void room_on_transport_close(int code, const char* reason, void* userdata) {
     colyseus_room_t* room = (colyseus_room_t*)userdata;
+    room_dispatch_enter(room);
+    room_handle_close(room, code, reason);
+    room_dispatch_exit(room);
+}
+
+static void room_handle_close(colyseus_room_t* room, int code, const char* reason) {
+    /* in-flight requests can't be answered on a closed socket */
+    room_reject_all_pending_requests(room, "connection closed before a response was received.");
+
+    /* left locally (see leave()): this is the aborted attempt closing */
+    if (room_has_left(room)) return;
 
     if (!room->has_joined) {
         /* Connection died before the first JOIN_ROOM — report as error to the
@@ -1353,10 +2151,12 @@ static void room_on_transport_close(int code, const char* reason, void* userdata
         if (room->serializer) {
             colyseus_schema_serializer_teardown(room->serializer);
         }
+        if (room->join_error_reported) return;
         fprintf(stderr, "Room connection closed unexpectedly: %s\n", reason);
         if (room->on_error) {
             room->on_error(code, reason, room->on_error_userdata);
         }
+        room_connect_settle(room, false, code, reason);
         return;
     }
 
@@ -1367,32 +2167,49 @@ static void room_on_transport_close(int code, const char* reason, void* userdata
         return;
     }
 
+    /* a consented leave() is waiting on this close: a drop ends it as consented */
+    if (room_is_leaving(room) && room_close_code_is_drop(code)) {
+        room_finish(room, COLYSEUS_CLOSE_CONSENTED, reason);
+        return;
+    }
+
     bool reconnectable = room->reconnection.options.enabled
                       && room_close_code_is_drop(code);
 
     if (reconnectable) {
         if (room->on_drop) {
+            colyseus_reconnection_worker_t* w =
+                (colyseus_reconnection_worker_t*)room->reconnection.worker;
+            if (w) __atomic_store_n(&w->dropping, true, __ATOMIC_RELEASE);
             room->on_drop(code, reason, room->on_drop_userdata);
+            if (w) __atomic_store_n(&w->dropping, false, __ATOMIC_RELEASE);
         }
         room_handle_reconnection(room, code, reason);
         return;
     }
 
     /* Final close — tear down state and notify. */
-    if (room->serializer) {
-        colyseus_schema_serializer_teardown(room->serializer);
-    }
-    if (room->on_leave) {
-        room->on_leave(code, reason, room->on_leave_userdata);
-    }
+    room_finish(room, code, reason);
 }
 
 static void room_on_transport_error(const char* error, void* userdata) {
     colyseus_room_t* room = (colyseus_room_t*)userdata;
 
+    /* a room that has left ignores its socket */
+    if (room_has_left(room)) return;
+
     fprintf(stderr, "Room transport error: %s\n", error);
     if (room->on_error) {
+        room_dispatch_enter(room);
         room->on_error(-1, error, room->on_error_userdata);
+        room_dispatch_exit(room);
+    }
+
+    /* before the first JOIN_ROOM an error ends the connect, whether or not a close follows */
+    if (!room->has_joined) {
+        room_dispatch_enter(room);
+        room_connect_settle(room, false, -1, error);
+        room_dispatch_exit(room);
     }
 
     /* connect() can fail before a socket exists (DNS down after an Android

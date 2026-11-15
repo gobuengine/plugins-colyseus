@@ -27,7 +27,23 @@ typedef struct {
     void* userdata;  /* User data passed to all callbacks */
 } colyseus_transport_events_t;
 
-/* Transport interface (vtable pattern) */
+/**
+ * Transport interface (vtable pattern).
+ *
+ * Threading contract: connect/send/close/destroy may be called from any
+ * thread. Callbacks fire on the transport's driving thread (the native
+ * WebSocket tick thread; the event loop on web).
+ *
+ * close() reports on_close once: synchronously when called off the driving
+ * thread, otherwise on the driving thread after the current callback returns.
+ * No message is delivered after close().
+ *
+ * destroy() from inside a callback is the last word both ways: nothing fires
+ * after it, and the transport frees itself once the callback returns. Off the
+ * driving thread destroy() closes first (natively on_close fires inside it,
+ * before the pointer dies) and frees synchronously. A destroy nested inside
+ * that on_close is a no-op.
+ */
 struct colyseus_transport {
     /* Function pointers (vtable) */
     void (*connect)(colyseus_transport_t* transport, const char* url);

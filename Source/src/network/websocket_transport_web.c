@@ -8,9 +8,9 @@
 #include <stdio.h>
 
 // ============================================================================
-// SIDE_MODULE (Gobu) - Uses polling approach since JS can't callback to C
+// SIDE_MODULE (Godot) - Uses polling approach since JS can't callback to C
 // ============================================================================
-#ifdef COLYSEUS_SIDE_MODULE
+#ifdef GDEXTENSION_SIDE_MODULE
 
 typedef struct {
     int socket_id;
@@ -153,12 +153,16 @@ void colyseus_ws_poll(void) {
                 "Module._colyseusWs.events[%d].closeCode || 1000",
                 data->socket_id);
             int code = emscripten_run_script_int(script);
-            
+
             snprintf(script, sizeof(script),
-                "delete Module._colyseusWs.events[%d]", data->socket_id);
+                "delete Module._colyseusWs.sockets[%d]; delete Module._colyseusWs.events[%d];",
+                data->socket_id, data->socket_id);
             emscripten_run_script(script);
-            
+
             printf("[WebSocket] Closed: code=%d\n", code);
+            // Retire the socket BEFORE the callback — on_close can arm a
+            // reconnect that destroys/replaces this transport.
+            data->socket_id = -1;
             data->is_open = false;
             if (transport->events.on_close) {
                 transport->events.on_close(code, "", transport->events.userdata);
@@ -343,8 +347,10 @@ static void web_ws_close_impl(colyseus_transport_t* transport, int code, const c
         
         emscripten_run_script(script);
         free(escaped_reason);
-        
-        data->socket_id = -1;
+
+        // Keep socket_id: the JS onclose lands in events[id] and the next
+        // colyseus_ws_poll delivers on_close — clearing the id here orphans
+        // the event, so a LOCAL close (room.drop) would never reach the SDK.
     }
     data->is_open = false;
 }
@@ -565,7 +571,25 @@ static void web_ws_destroy_impl(colyseus_transport_t* transport) {
     free(transport);
 }
 
-#endif /* COLYSEUS_SIDE_MODULE */
+/* Callbacks already run on the browser's event loop. */
+void colyseus_ws_poll(void) {}
+
+#endif /* GDEXTENSION_SIDE_MODULE */
+
+/* Web is single-threaded: every mode is already polled. */
+void colyseus_ws_set_polled(bool polled) {
+    (void)polled;
+}
+
+/* Internal (room.c, latency.c): no modes to pin on the web. */
+bool colyseus_ws_polled_default(void) {
+    return false;
+}
+
+void colyseus_ws_pin_polled(colyseus_transport_t* transport, bool polled) {
+    (void)transport;
+    (void)polled;
+}
 
 /* Web stub: browser handles TLS natively, so settings are ignored */
 void colyseus_websocket_connect_with_settings(colyseus_transport_t* transport,

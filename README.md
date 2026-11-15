@@ -1,6 +1,7 @@
 # Colyseus
 
-Colyseus SDK v0.18.0 as a Gobu plugin, and the `colyseus` provider of Gobu's Online.
+Colyseus SDK v0.18.15 as a Gobu plugin, and the `colyseus` provider of Gobu's Online. Its server is Colyseus 0.18
+(`Source/server`); Online also plays on a 0.17 one, the `Colyseus` Grost module's room state needs 0.18.
 
 Install it from Gobu's **Edit > Plugins** (it downloads the latest release of this repository into
 `<project>/plugins/colyseus` and enables it), or copy the `colyseus` folder there by hand. Guide:

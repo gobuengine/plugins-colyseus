@@ -7,10 +7,19 @@
 #include <string.h>
 #include <stdio.h>
 
+/* the auth routes' paths lead with '/', the matchmaker's don't */
+static char* http_build_url(const char* base, const char* path) {
+    const char* sep = (path[0] == '/') ? "" : "/";
+    size_t len = strlen(base) + strlen(sep) + strlen(path) + 1;
+    char* url = malloc(len);
+    snprintf(url, len, "%s%s%s", base, sep, path);
+    return url;
+}
+
 // ============================================================================
-// SIDE_MODULE (Gobu) - Uses polling approach since JS can't callback to C
+// SIDE_MODULE (Godot) - Uses polling approach since JS can't callback to C
 // ============================================================================
-#ifdef COLYSEUS_SIDE_MODULE
+#ifdef GDEXTENSION_SIDE_MODULE
 
 typedef struct {
     int request_id;
@@ -175,9 +184,7 @@ static void http_fetch_request(
         return;
     }
     
-    size_t url_len = strlen(base_url) + strlen(path) + 2;
-    char* full_url = malloc(url_len);
-    snprintf(full_url, url_len, "%s/%s", base_url, path);
+    char* full_url = http_build_url(base_url, path);
     free(base_url);
     
     printf("[HTTP] %s %s\n", method, full_url);
@@ -202,8 +209,10 @@ static void http_fetch_request(
     
     char* escaped_url = escape_json_string(full_url);
     char* escaped_body = json_body ? escape_json_string(json_body) : strdup("null");
+    char* escaped_token = (http_client->auth_token && http_client->auth_token[0])
+        ? escape_json_string(http_client->auth_token) : strdup("null");
     
-    size_t script_len = 2048 + strlen(escaped_url) + strlen(escaped_body);
+    size_t script_len = 2048 + strlen(escaped_url) + strlen(escaped_body) + strlen(escaped_token);
     char* script = malloc(script_len);
     
     snprintf(script, script_len,
@@ -212,7 +221,9 @@ static void http_fetch_request(
         "  var url = %s;"
         "  var method = \"%s\";"
         "  var body = %s;"
+        "  var token = %s;"
         "  var opts = { method: method, headers: { \"Content-Type\": \"application/json\", \"Accept\": \"application/json\" } };"
+        "  if (token !== null) opts.headers[\"Authorization\"] = \"Bearer \" + token;"
         "  if (body !== null && method !== \"GET\") opts.body = body;"
         "  fetch(url, opts)"
         "    .then(function(r) { return r.text().then(function(t) { return { status: r.status, body: t, ok: r.ok }; }); })"
@@ -226,7 +237,8 @@ static void http_fetch_request(
         request_id,
         escaped_url,
         method,
-        escaped_body
+        escaped_body,
+        escaped_token
     );
     
     emscripten_run_script(script);
@@ -234,6 +246,7 @@ static void http_fetch_request(
     free(script);
     free(escaped_url);
     free(escaped_body);
+    free(escaped_token);
     free(full_url);
 }
 
@@ -244,10 +257,18 @@ static void http_fetch_request(
 
 #include <emscripten/fetch.h>
 
+/* emscripten_fetch completes on the browser's event loop — nothing to poll,
+ * but colyseus_poll() calls this on every build */
+void colyseus_http_poll(void) {}
+
 typedef struct {
     colyseus_http_success_callback_t on_success;
     colyseus_http_error_callback_t on_error;
     void* userdata;
+    /* emscripten_fetch reads requestData when the browser SENDS, not at the
+     * call — the bytes must outlive the caller's buffer, so ctx owns a copy */
+    char* body_copy;
+    char* bearer;  /* "Bearer <token>", held for the same reason */
 } http_request_context_t;
 
 static void on_fetch_success(emscripten_fetch_t* fetch) {
@@ -264,6 +285,10 @@ static void on_fetch_success(emscripten_fetch_t* fetch) {
         free(response.body);
     }
     
+    if (ctx) {
+        free(ctx->body_copy);
+        free(ctx->bearer);
+    }
     free(ctx);
     emscripten_fetch_close(fetch);
 }
@@ -276,11 +301,19 @@ static void on_fetch_error(emscripten_fetch_t* fetch) {
     if (ctx && ctx->on_error) {
         colyseus_http_error_t error;
         error.code = fetch->status;
-        error.message = strdup(fetch->statusText[0] ? fetch->statusText : "Network error");
+        /* the body carries the reason, as on native: Colyseus' 52x codes
+         * have no status text ("unknown") */
+        error.message = fetch->numBytes > 0
+            ? strndup(fetch->data, fetch->numBytes)
+            : strdup(fetch->statusText[0] ? fetch->statusText : "Network error");
         ctx->on_error(&error, ctx->userdata);
         free(error.message);
     }
     
+    if (ctx) {
+        free(ctx->body_copy);
+        free(ctx->bearer);
+    }
     free(ctx);
     emscripten_fetch_close(fetch);
 }
@@ -303,9 +336,7 @@ static void http_fetch_request(
         return;
     }
     
-    size_t url_len = strlen(base_url) + strlen(path) + 2;
-    char* full_url = malloc(url_len);
-    snprintf(full_url, url_len, "%s/%s", base_url, path);
+    char* full_url = http_build_url(base_url, path);
     free(base_url);
     
     printf("[HTTP] %s %s\n", method, full_url);
@@ -317,6 +348,8 @@ static void http_fetch_request(
     ctx->on_success = on_success;
     ctx->on_error = on_error;
     ctx->userdata = userdata;
+    ctx->body_copy = NULL;
+    ctx->bearer = NULL;
     
     emscripten_fetch_attr_t attr;
     emscripten_fetch_attr_init(&attr);
@@ -329,20 +362,29 @@ static void http_fetch_request(
     const char* headers[] = {
         "Content-Type", "application/json",
         "Accept", "application/json",
+        NULL, NULL,  /* Authorization, when signed in */
         NULL
     };
+    if (http_client->auth_token && http_client->auth_token[0]) {
+        size_t bearer_len = strlen(http_client->auth_token) + sizeof("Bearer ");
+        ctx->bearer = malloc(bearer_len);
+        snprintf(ctx->bearer, bearer_len, "Bearer %s", http_client->auth_token);
+        headers[4] = "Authorization";
+        headers[5] = ctx->bearer;
+    }
     attr.requestHeaders = headers;
     
     if (json_body && strcmp(method, "GET") != 0) {
-        attr.requestData = json_body;
-        attr.requestDataSize = strlen(json_body);
+        ctx->body_copy = strdup(json_body);
+        attr.requestData = ctx->body_copy;
+        attr.requestDataSize = strlen(ctx->body_copy);
     }
     
     emscripten_fetch(&attr, full_url);
     free(full_url);
 }
 
-#endif /* COLYSEUS_SIDE_MODULE */
+#endif /* GDEXTENSION_SIDE_MODULE */
 
 colyseus_http_t* colyseus_http_create(const colyseus_settings_t* settings) {
     colyseus_http_t* http = malloc(sizeof(colyseus_http_t));

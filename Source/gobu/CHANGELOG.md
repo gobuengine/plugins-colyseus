@@ -5,6 +5,25 @@ the repository's history.
 
 ## Gobu
 
+### 0.18.3: the Colyseus Native SDK 0.18.15
+- `Source/src` and `Source/include` are the SDK's 0.18.15 (it was the copy of 2026-08-21, before its 0.18.0). Its
+  fixes: automatic reconnection worked once and `reconnect()` with a token never did; leaving a room while it
+  reconnected could come back or deadlock; leaving with an instance in two places of the state crashed; a failed
+  join reports the server's text and code (not 500, nor a second error); a signed-in client sends its token to the
+  room (`onAuth`), and on the web the auth routes answer; Android resolves hostnames; Windows stops waiting on a
+  refused connection; `localhost` works with a server that listens only on IPv6; callbacks as the TypeScript SDK's
+  (no `listen` for a value sent unchanged, `on_add` once for primitive maps, `ArraySchema` in the server's order);
+  up to 8 callbacks layers per room (`room.callbacks()` used to take the only one). It has the predict layer too
+  (not bound yet).
+- Gobu's own changes to the SDK are in it now (the tick thread's close, `ArraySchema` order and renumbering, a
+  re-sent ADD), except the web's macro: `gobu/build.zig` defines `GDEXTENSION_SIDE_MODULE` (the SDK's name) next
+  to `COLYSEUS_SIDE_MODULE`, and lists the SDK's new sources (clock, input, latency, net delay, quantize, predict).
+- The room state needs a Colyseus 0.18 server (`@colyseus/schema` 5): `Source/server` is on Colyseus 0.18. Online
+  (the relay room, bytes only) plays on 0.17 and 0.18 servers.
+- Tried with a local server: the `Colyseus` module (HTTP, Auth's error, join, messages, state, `listen`, `on_add`,
+  leave) on 0.18, and Online (a host and a game that joins, host migration) on 0.17 and 0.18. The web and Android
+  libraries build; they weren't run.
+
 ### 0.18.2: the Grost module for today's Grost
 - `colyseus.gro` compiles again: Grost removed `any` and values of unknown type (2026-11-03), and the module
   still had them (151 errors), so a game that used `Colyseus.*` didn't compile. The native objects are typed

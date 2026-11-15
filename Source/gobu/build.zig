@@ -190,6 +190,18 @@ pub fn build(b: *std.Build) void {
                 "../src/schema/serializer.c",
                 "../src/schema/callbacks.c",
                 "../src/schema/dynamic_schema.c",
+                // Clock, input, latency and the predict layer (SDK 0.18.x)
+                "../src/room_clock.c",
+                "../src/input_handle.c",
+                "../src/network/latency.c",
+                "../src/network/net_delay.c",
+                "../src/schema/encode.c",
+                "../src/schema/input_encoder.c",
+                "../src/schema/quantize.c",
+                "../src/predict/predict.c",
+                "../src/predict/reconciler.c",
+                "../src/predict/events.c",
+                "../src/predict/spawns.c",
                 // Utils
                 "../src/utils/strUtil.c",
                 "../src/utils/sha1_c.c",
@@ -257,6 +269,8 @@ pub fn build(b: *std.Build) void {
             emcc.addArgs(&.{
                 "-DPLATFORM_WEB",
                 "-DCOLYSEUS_SIDE_MODULE",
+                // The SDK's name for the same (its web transport and HTTP poll from the host).
+                "-DGDEXTENSION_SIDE_MODULE",
             });
 
             // Output path for the WASM file
@@ -405,6 +419,18 @@ pub fn build(b: *std.Build) void {
                 "../src/schema/serializer.c",
                 "../src/schema/callbacks.c",
                 "../src/schema/dynamic_schema.c",
+                // Clock, input, latency and the predict layer (SDK 0.18.x)
+                "../src/room_clock.c",
+                "../src/input_handle.c",
+                "../src/network/latency.c",
+                "../src/network/net_delay.c",
+                "../src/schema/encode.c",
+                "../src/schema/input_encoder.c",
+                "../src/schema/quantize.c",
+                "../src/predict/predict.c",
+                "../src/predict/reconciler.c",
+                "../src/predict/events.c",
+                "../src/predict/spawns.c",
                 // Utils
                 "../src/utils/strUtil.c",
                 "../src/utils/sha1_c.c",

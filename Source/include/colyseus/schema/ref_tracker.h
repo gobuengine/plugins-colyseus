@@ -39,10 +39,18 @@ typedef struct colyseus_deleted_ref {
     struct colyseus_deleted_ref* next;
 } colyseus_deleted_ref_t;
 
+/* Told about every ref the GC collects, once it has left the tracker. */
+typedef void (*colyseus_ref_collect_fn)(int ref_id, void* userdata);
+
+#define COLYSEUS_REF_TRACKER_MAX_COLLECT_LISTENERS 8
+
 /* Reference tracker */
 struct colyseus_ref_tracker {
     colyseus_ref_entry_t* refs;         /* Hash table of refs */
     colyseus_deleted_ref_t* deleted;    /* List of refs pending deletion */
+    colyseus_ref_collect_fn collect_listeners[COLYSEUS_REF_TRACKER_MAX_COLLECT_LISTENERS];
+    void* collect_userdata[COLYSEUS_REF_TRACKER_MAX_COLLECT_LISTENERS];
+    int collect_count;
 };
 
 /* Create/destroy tracker */
@@ -62,14 +70,49 @@ colyseus_ref_entry_t* colyseus_ref_tracker_get_entry(colyseus_ref_tracker_t* tra
 /* Check if reference exists */
 bool colyseus_ref_tracker_has(colyseus_ref_tracker_t* tracker, int ref_id);
 
+/* Number of tracked references */
+size_t colyseus_ref_tracker_count(colyseus_ref_tracker_t* tracker);
+
 /* Remove a reference (decrements count, schedules for GC if count reaches 0) */
 bool colyseus_ref_tracker_remove(colyseus_ref_tracker_t* tracker, int ref_id);
 
 /* Run garbage collection */
 void colyseus_ref_tracker_gc(colyseus_ref_tracker_t* tracker);
 
+/*
+ * Subscribe to GC collections. A server reuses a refId once the client has
+ * dropped it (a StateView re-adding an entity sends the same id), so anything
+ * keyed by refId has to be forgotten when the ref is collected — the callbacks
+ * layer drops that ref's registrations here, as the TS decoder does.
+ * Returns false (and logs) when the listener table is full.
+ */
+bool colyseus_ref_tracker_add_collect_listener(colyseus_ref_tracker_t* tracker,
+    colyseus_ref_collect_fn listener, void* userdata);
+void colyseus_ref_tracker_remove_collect_listener(colyseus_ref_tracker_t* tracker,
+    colyseus_ref_collect_fn listener, void* userdata);
+
 /* Clear all references */
 void colyseus_ref_tracker_clear(colyseus_ref_tracker_t* tracker);
+
+/*
+ * Release every STATIC-schema ref the tracker holds, except `except_ref`
+ * (the caller's root, which it destroys itself).
+ *
+ * schema-codegen's generated `destroy` frees its own `char*` fields and
+ * recurses into `t.ref()` children, but NEVER into a map or array. So the
+ * orphans are exactly: every collection structure and the schema entries it
+ * holds. That is what this releases; ref children are otherwise left to the
+ * root's own recursive destroy — except where one aliases a collection entry
+ * (the same Player as both `players[id]` and `host`), which would then be
+ * freed twice, so those fields are NULLed here.
+ * Freed refs are NULLed, so a later clear() skips them.
+ */
+void colyseus_ref_tracker_destroy_static_refs(colyseus_ref_tracker_t* tracker, void* except_ref);
+
+/* Free and NULL the heap `char*` fields of a static schema instance, so a
+ * later codegen destroy() can't free them again. Safe on dynamic instances —
+ * it does nothing. */
+void colyseus_schema_free_string_fields(colyseus_schema_t* instance);
 
 #ifdef __cplusplus
 }
